@@ -20,8 +20,8 @@ local playback:
    [librespot](https://github.com/librespot-org/librespot). It needs one more
    browser approval and stores its own reusable credential. Spotify Premium
    is required. While it is signed in, its session also reads the playlists
-   other people own, which neither Web API app can serve without spending the
-   shared quota.
+   the shared app would otherwise be asked for: other people's, and the
+   account's own when there is no personal app.
 
 Local playback authorization stays separate from both Web API grants.
 

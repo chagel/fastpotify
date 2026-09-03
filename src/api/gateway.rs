@@ -106,19 +106,20 @@ pub enum Route {
     Session,
 }
 
-/// The streaming session reads the playlists other people own, which no
-/// personal app may read and which would otherwise spend the shared app's
-/// quota. The account's own playlists stay on the Web API: it alone says
-/// whether one is public, which editing its details needs.
+/// The streaming session reads every playlist the shared app would have
+/// been asked for: other people's, which no personal app may read, and the
+/// account's own when it has no personal app. A personal app keeps its own
+/// playlists, which it reads quickly and with every field.
 fn route(operation: Operation, personal_ready: bool, session_ready: bool) -> Route {
-    match operation {
-        Operation::PlaylistMetadata(access) | Operation::PlaylistItems(access)
-            if session_ready
-                && matches!(access, PlaylistAccess::External | PlaylistAccess::Unknown) =>
-        {
-            Route::Session
-        }
-        _ => Route::Web(plan(operation, personal_ready)),
+    let source = plan(operation, personal_ready);
+    let playlist_read = matches!(
+        operation,
+        Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_)
+    );
+    if session_ready && playlist_read && source == ApiSource::Shared {
+        Route::Session
+    } else {
+        Route::Web(source)
     }
 }
 
@@ -339,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_reads_other_peoples_playlists() {
+    fn the_session_reads_what_the_shared_app_would_have() {
         let external = Operation::PlaylistItems(PlaylistAccess::External);
         assert_eq!(route(external, true, true), Route::Session);
         assert_eq!(
@@ -367,8 +368,8 @@ mod tests {
                 false,
                 true
             ),
-            Route::Web(ApiSource::Shared),
-            "only the Web API says whether an own playlist is public"
+            Route::Session,
+            "without a personal app, own playlists leave the shared app too"
         );
         assert_eq!(
             route(
