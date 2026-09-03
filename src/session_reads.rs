@@ -3,7 +3,7 @@
 //! no per-app quota, so a playlist someone else owns opens without waiting on
 //! the shared app's rate limit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use base64::Engine as _;
 use librespot_core::{FileId, Session, error::ErrorKind, spotify_id::SpotifyId};
@@ -238,7 +238,8 @@ async fn metadata(
     uris: &[&str],
 ) -> Result<HashMap<String, PlayableItem>, Failure> {
     let mut request = BatchedEntityRequest::new();
-    for uri in uris {
+    // A playlist can hold the same song twice; ask for it once.
+    for uri in uris.iter().copied().collect::<BTreeSet<_>>() {
         let kind = match uri_kind(uri) {
             Some("track") => ExtensionKind::TRACK_V4,
             Some("episode") => ExtensionKind::EPISODE_V4,

@@ -6075,7 +6075,7 @@ mod tests {
     /// and the edit dialog fills its switch from it, so the library list's
     /// answer stands in.
     #[test]
-    fn a_header_without_a_public_flag_takes_the_librarys() {
+    fn a_header_without_a_public_flag_takes_the_library_lists() {
         let mut app = headless_app();
         app.backend.set_offline(true);
         app.library.playlists = Loadable::Loaded(vec![Playlist {
