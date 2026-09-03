@@ -76,6 +76,47 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 }
+                Dialog::ConfirmPlaylistDuplicates {
+                    playlist_id,
+                    playlist_name,
+                    items,
+                    duplicate_uris,
+                } => {
+                    let multiple = items.len() > 1;
+                    theme::text(
+                        ui,
+                        if multiple {
+                            "Songs already in this playlist"
+                        } else {
+                            "Song already in this playlist"
+                        },
+                        theme::bold(20.0),
+                        palette.text,
+                    );
+                    ui.add_space(8.0);
+                    let body = duplicate_message(&playlist_name, &items, &duplicate_uris);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(body)
+                                .font(theme::regular(14.0))
+                                .color(palette.secondary),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(20.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::pill_button(ui, &palette, "Add anyway", true).clicked() {
+                            app.actions.push(Action::ConfirmAddToPlaylist {
+                                playlist_id: playlist_id.clone(),
+                                playlist_name: playlist_name.clone(),
+                                items: items.clone(),
+                            });
+                        }
+                        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+                            app.actions.push(Action::CloseDialog);
+                        }
+                    });
+                }
                 Dialog::Shortcuts => {
                     theme::text(ui, "Keyboard shortcuts", theme::bold(20.0), palette.text);
                     ui.add_space(12.0);
@@ -153,6 +194,35 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     if response.should_close() {
         app.actions.push(Action::CloseDialog);
     }
+}
+
+fn duplicate_message(
+    playlist_name: &str,
+    items: &[crate::api::models::PlayableItem],
+    duplicate_uris: &[String],
+) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let names: Vec<&str> = items
+        .iter()
+        .filter(|item| duplicate_uris.iter().any(|uri| uri == item.uri()))
+        .map(crate::api::models::PlayableItem::name)
+        .filter(|name| seen.insert(*name))
+        .collect();
+    let named = match names.as_slice() {
+        [] => "This song".to_string(),
+        [name] => format!("“{name}”"),
+        [first, second] => format!("“{first}” and “{second}”"),
+        [first, second, rest @ ..] => {
+            format!("“{first}”, “{second}”, and {} more", rest.len())
+        }
+    };
+    let verb = if names.len() <= 1 { "is" } else { "are" };
+    let question = if items.len() == 1 {
+        "Add it again?"
+    } else {
+        "Add all selected songs anyway?"
+    };
+    format!("{named} {verb} already in “{playlist_name}”. {question}")
 }
 
 fn text_field(
@@ -301,4 +371,51 @@ fn edit_playlist(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duplicate_message;
+    use crate::api::models::{PlayableItem, Track};
+
+    fn song(uri: &str, name: &str) -> PlayableItem {
+        PlayableItem::Track(Track {
+            uri: uri.into(),
+            name: name.into(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn duplicate_dialog_names_the_song() {
+        let items = vec![song("spotify:track:honey", "Honey")];
+        let message = duplicate_message(
+            "The best music ever",
+            &items,
+            &["spotify:track:honey".into()],
+        );
+
+        assert_eq!(
+            message,
+            "“Honey” is already in “The best music ever”. Add it again?"
+        );
+    }
+
+    #[test]
+    fn duplicate_dialog_names_only_the_duplicates_in_a_selection() {
+        let items = vec![
+            song("spotify:track:honey", "Honey"),
+            song("spotify:track:new", "New song"),
+        ];
+        let message = duplicate_message(
+            "The best music ever",
+            &items,
+            &["spotify:track:honey".into()],
+        );
+
+        assert_eq!(
+            message,
+            "“Honey” is already in “The best music ever”. Add all selected songs anyway?"
+        );
+    }
 }

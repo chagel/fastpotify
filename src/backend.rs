@@ -123,6 +123,11 @@ pub enum ApiRequest {
         description: Option<String>,
         public: Option<bool>,
     },
+    CheckPlaylistDuplicates {
+        playlist_id: String,
+        playlist_name: String,
+        items: Vec<PlayableItem>,
+    },
     AddToPlaylist {
         playlist_id: String,
         playlist_name: String,
@@ -309,6 +314,12 @@ pub enum ApiResponse {
     PlaylistUpdated {
         id: String,
         result: ApiResult<()>,
+    },
+    PlaylistDuplicatesChecked {
+        playlist_id: String,
+        playlist_name: String,
+        items: Vec<PlayableItem>,
+        result: ApiResult<Vec<String>>,
     },
     PlaylistItemsChanged {
         id: String,
@@ -1756,9 +1767,11 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         ApiRequest::CreatePlaylist { .. } => Operation::PlaylistCreation,
         ApiRequest::Discover { .. } | ApiRequest::Search { .. } => Operation::PlaylistSearch,
         ApiRequest::Playlist { id, .. } => Operation::PlaylistMetadata(api.playlist_access(id)),
-        ApiRequest::PlaylistItems { id, .. } | ApiRequest::PlaylistSample { id, .. } => {
-            Operation::PlaylistItems(api.playlist_access(id))
-        }
+        ApiRequest::PlaylistItems { id, .. }
+        | ApiRequest::PlaylistSample { id, .. }
+        | ApiRequest::CheckPlaylistDuplicates {
+            playlist_id: id, ..
+        } => Operation::PlaylistItems(api.playlist_access(id)),
         ApiRequest::UpdatePlaylist { id, .. } | ApiRequest::FollowPlaylist { id, .. } => {
             Operation::PlaylistMutation(api.playlist_access(id))
         }
@@ -1819,6 +1832,11 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
         }
         | ApiResponse::PlaylistSample {
             id,
+            result: Err(error),
+            ..
+        }
+        | ApiResponse::PlaylistDuplicatesChecked {
+            playlist_id: id,
             result: Err(error),
             ..
         }
@@ -1960,6 +1978,19 @@ async fn handle(
             )),
             id,
         },
+        ApiRequest::CheckPlaylistDuplicates {
+            playlist_id,
+            playlist_name,
+            items,
+        } => {
+            let uris: Vec<String> = items.iter().map(|item| item.uri().to_string()).collect();
+            ApiResponse::PlaylistDuplicatesChecked {
+                result: routed!(playlist_duplicates(&playlist_id, &uris)),
+                playlist_id,
+                playlist_name,
+                items,
+            }
+        }
         ApiRequest::AddToPlaylist {
             playlist_id,
             playlist_name,

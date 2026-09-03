@@ -34,6 +34,13 @@ Progress through a playlist is periodically cached as a contiguous prefix.
 When the playlist has not changed on Spotify, reopening it resumes from that
 prefix instead of requesting the same pages again. Fastpotify validates the
 cache against Spotify's playlist snapshot before showing it.
+Successful playlist edits keep that loaded prefix and save it under Spotify's
+new snapshot. Fastpotify reloads the playlist only if the write fails and the
+optimistic edit must be reconciled.
+
+The last good playlist folder tree is kept in `session.json`, scoped to the
+account that supplied it. This keeps folders visible when local playback is
+temporarily unavailable. Live session data is still required for edit grants.
 
 Large playlist pages also have a **Go to song** control. Entering a song
 number loads its 50-item page directly, without requesting every earlier page.
@@ -89,6 +96,7 @@ main fields are:
 | `keep_playing_in_background` | `true` | Close to tray |
 | `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
 | `web_client_id` | none | Optional personal Spotify app id used alongside shared coverage |
+| `personal_app_nudge_at` | none | Last slow-Spotify personal-app reminder, so it appears at most once a day |
 
 ## Command line
 
@@ -117,11 +125,11 @@ settings.
 
 `--demo-page` opens a page, such as `home`, `playlist:pl1`, or `artist:art0`,
 and `--demo-show` adds surfaces on top of it: a comma separated list of
-`queue`, `devices`, `shortcuts`, `premium`, `create`, `light`, `focus`, `winamp`,
-`playlist`, `eq`, `eq-shade`, and `compact`.
+`queue`, `devices`, `shortcuts`, `premium`, `create`, `duplicate`, `light`,
+`focus`, `winamp`, `playlist`, `eq`, `eq-shade`, and `compact`.
 
-`--demo-shot <PATH>` writes the window to a PNG and exits, which is how the
-screenshots in these pages are made:
+`--demo-shot <PATH>` writes the window to a PNG and exits, which is useful for
+making deterministic screenshots for these pages:
 
 ```
 cargo run --release --features demo -- \

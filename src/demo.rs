@@ -565,7 +565,7 @@ pub fn populate(app: &mut App) {
 
 /// Words to go with the sample track, timed so that the one being sung
 /// sits mid-panel at the demo's playback position.
-#[cfg(feature = "demo")]
+#[cfg(any(test, feature = "demo"))]
 fn sample_lyrics() -> crate::lyrics::Lyrics {
     let lines = [
         (40_000, "Streetlights blinking down the river road"),
@@ -619,6 +619,14 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     name: "Autumn drives".into(),
                     public: false,
                     add_uris: vec!["spotify:track:trk1".into()],
+                })
+            }
+            "duplicate" => {
+                app.dialog = Some(Dialog::ConfirmPlaylistDuplicates {
+                    playlist_id: "pl1".into(),
+                    playlist_name: "Long Way Home".into(),
+                    items: vec![PlayableItem::Track(track(1))],
+                    duplicate_uris: vec!["spotify:track:trk1".into()],
                 })
             }
             "light" => {
@@ -1099,13 +1107,9 @@ mod tests {
         app.backend.shutdown();
     }
 
-    /// Rule: at its narrowest the queue panel still puts its header on
-    /// one line. The chips used to wrap under the buttons, and then,
-    /// once the buttons were given their room first, onto a second row,
-    /// which is a lot of panel spent on saying what two words already
-    /// said.
+    /// Rule: side-panel headers stay on one line at their narrowest width.
     #[test]
-    fn the_narrowest_panel_keeps_its_header_on_one_row() {
+    fn the_narrowest_panels_keep_their_headers_on_one_row() {
         let root = std::env::temp_dir().join(format!(
             "fastpotify-queue-header-test-{}",
             std::process::id()
@@ -1129,11 +1133,11 @@ mod tests {
         );
         app.attach(&ctx);
         populate(&mut app);
-        app.show_queue_panel = true;
         app.settings.queue_width = crate::theme::SIDE_PANEL_MIN_WIDTH;
+        app.settings.lyrics_width = crate::theme::SIDE_PANEL_MIN_WIDTH;
+        app.lyrics = Loadable::Loaded(Some(sample_lyrics()));
+        app.lyrics_following = false;
 
-        // Where each piece of text was actually drawn.
-        let mut placed: Vec<(String, f32)> = Vec::new();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1141,39 +1145,58 @@ mod tests {
             )),
             ..Default::default()
         };
-        // The panel applies its width after the first frame.
-        for _ in 0..2 {
-            placed.clear();
-            let mut output = ctx.run_ui(input.clone(), |ui| app.frame_ui(ui));
-            output.textures_delta.clear();
-            fn walk(shape: &egui::epaint::Shape, placed: &mut Vec<(String, f32)>) {
-                match shape {
-                    egui::epaint::Shape::Text(text) => {
-                        placed.push((text.galley.job.text.clone(), text.pos.y))
+        let drawn = |app: &mut App| {
+            let mut placed = Vec::new();
+            // A panel applies its requested width after the first frame.
+            for _ in 0..2 {
+                placed.clear();
+                let mut output = ctx.run_ui(input.clone(), |ui| app.frame_ui(ui));
+                output.textures_delta.clear();
+                fn walk(shape: &egui::epaint::Shape, placed: &mut Vec<(String, egui::Rect)>) {
+                    match shape {
+                        egui::epaint::Shape::Text(text) => {
+                            placed.push((text.galley.job.text.clone(), text.visual_bounding_rect()))
+                        }
+                        egui::epaint::Shape::Vec(shapes) => {
+                            shapes.iter().for_each(|shape| walk(shape, placed))
+                        }
+                        _ => {}
                     }
-                    egui::epaint::Shape::Vec(shapes) => {
-                        shapes.iter().for_each(|shape| walk(shape, placed))
-                    }
-                    _ => {}
+                }
+                for clipped in &output.shapes {
+                    walk(&clipped.shape, &mut placed);
                 }
             }
-            for clipped in &output.shapes {
-                walk(&clipped.shape, &mut placed);
+            placed
+        };
+        let assert_same_row = |placed: &[(String, egui::Rect)], left: &str, right: &str| {
+            let at = |label: &str| {
+                placed
+                    .iter()
+                    .find(|(text, _)| text == label)
+                    .unwrap_or_else(|| panic!("{label} was never drawn: {placed:?}"))
+                    .1
+            };
+            let (left_rect, right_rect) = (at(left), at(right));
+            assert!(
+                (left_rect.center().y - right_rect.center().y).abs() < 10.0
+                    && (left_rect.right() <= right_rect.left()
+                        || right_rect.right() <= left_rect.left()),
+                "{left} and {right} should share a clear row at minimum width: {left_rect:?} vs {right_rect:?}"
+            );
+        };
+
+        for (queue, lyrics) in [(false, false), (true, false), (false, true), (true, true)] {
+            app.show_queue_panel = queue;
+            app.show_lyrics_panel = lyrics;
+            let placed = drawn(&mut app);
+            if queue {
+                assert_same_row(&placed, "Queue", "Recent");
+            }
+            if lyrics {
+                assert_same_row(&placed, "Lyrics", "Follow");
             }
         }
-        let at = |label: &str| -> f32 {
-            placed
-                .iter()
-                .find(|(text, _)| text == label)
-                .unwrap_or_else(|| panic!("{label} was never drawn: {placed:?}"))
-                .1
-        };
-        let (queue, recents) = (at("Queue"), at("Recent"));
-        assert!(
-            (queue - recents).abs() < 1.0,
-            "both chips sit on one line at {} wide: Queue at {queue}, Recent at {recents}",
-            crate::theme::SIDE_PANEL_MIN_WIDTH
-        );
         app.backend.shutdown();
     }
 
@@ -1258,6 +1281,12 @@ mod tests {
                 name: "x".into(),
                 owned: true,
             },
+            Dialog::ConfirmPlaylistDuplicates {
+                playlist_id: "pl1".into(),
+                playlist_name: "x".into(),
+                items: vec![PlayableItem::Track(track(1))],
+                duplicate_uris: vec!["spotify:track:trk1".into()],
+            },
         ] {
             app.dialog = Some(dialog);
             frame(&ctx, &mut app);
@@ -1314,9 +1343,15 @@ mod tests {
             egui::DragAndDrop::set_payload(
                 &ctx,
                 DragTrack {
-                    uri: "spotify:track:trk0".into(),
-                    title: "Fragments".into(),
+                    uri: "spotify:track:not-in-demo-playlists".into(),
+                    title: "A new song".into(),
                     image: None,
+                    item: PlayableItem::Track(Track {
+                        id: Some("not-in-demo-playlists".into()),
+                        uri: "spotify:track:not-in-demo-playlists".into(),
+                        name: "A new song".into(),
+                        ..Default::default()
+                    }),
                     from: None,
                 },
             );
@@ -1338,6 +1373,79 @@ mod tests {
             }
         }
         assert!(dropped, "no sweep position landed on an owned playlist row");
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The cover and title in the bottom-left player are a song source, not
+    /// just links. The sidebar can therefore receive the same complete row it
+    /// receives when a table song is dragged.
+    #[test]
+    fn dragging_the_now_playing_song_supplies_a_playlist_row() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-now-playing-drag-test-{}",
+            std::process::id()
+        ));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let ctx = egui::Context::default();
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        populate(&mut app);
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+        }
+
+        let start = egui::pos2(40.0, 755.0);
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start + egui::vec2(20.0, -10.0))],
+        );
+
+        let payload = egui::DragAndDrop::payload::<DragTrack>(&ctx)
+            .expect("dragging the bottom-left song should create a song payload");
+        assert_eq!(payload.uri, "spotify:track:trk0");
+        assert_eq!(payload.item.uri(), "spotify:track:trk0");
+        assert_eq!(payload.from, None, "this is an add, not a playlist move");
+
+        egui::DragAndDrop::clear_payload(&ctx);
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
         app.backend.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1537,6 +1645,11 @@ mod tests {
             uri: uri.to_string(),
             title: "Closer".into(),
             image: None,
+            item: PlayableItem::Track(Track {
+                uri: uri.to_string(),
+                name: "Closer".into(),
+                ..Default::default()
+            }),
             from: Some(("pl1".into(), from as u32)),
         };
 
@@ -1666,7 +1779,7 @@ mod tests {
         app.attach(&ctx);
         populate(&mut app);
 
-        // Find the Y position of "Your Library" header.
+        // Find the Y position of the Library header.
         let mut library_y = None;
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1681,7 +1794,7 @@ mod tests {
             fn walk(shape: &egui::epaint::Shape, found: &mut Option<f32>) {
                 match shape {
                     egui::epaint::Shape::Text(text) => {
-                        if text.galley.job.text == "Your Library" {
+                        if text.galley.job.text == "Library" {
                             *found = Some(text.pos.y);
                         }
                     }
@@ -1695,10 +1808,10 @@ mod tests {
                 walk(&clipped.shape, &mut library_y);
             }
         }
-        let y = library_y.expect("Your Library label was not found");
+        let y = library_y.expect("Library label was not found");
         let search_pos = egui::pos2(168.0, y + 4.0);
 
-        // Click on the search button in the Your Library shelf header.
+        // Click on the search button in the Library shelf header.
         frame_events(
             &ctx,
             &mut app,

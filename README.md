@@ -10,7 +10,7 @@ browser engine.
 **Playback needs Spotify Premium.** Free accounts can browse and search, but
 cannot play music through Fastpotify on this computer or another device.
 
-![Fastpotify showing a playlist, with the queue open and a track playing on a remote speaker](docs/screenshot.png)
+![Fastpotify Home with the playlist library, recommendations, queue, and player visible](docs/screenshot.png)
 
 See [fastpotify.rocks](https://fastpotify.rocks/) for installation, setup,
 everyday use, and connection details.
@@ -37,9 +37,9 @@ everyday use, and connection details.
   artists. **Album**, **playlist**, and **podcast** pages support playback
   from any row.
 - **Edit your playlists.** Create, rename, describe, reorder, and delete them.
-  Add songs from a row menu or drag them to a playlist in the sidebar. A
-  playlist a friend shared with you takes songs too, as Spotify's own apps
-  allow.
+  Add songs from a row menu, or drag a row or the currently playing song to a
+  playlist in the sidebar. A playlist a friend shared with you takes songs too,
+  as Spotify's own apps allow.
 - **Opens Spotify links.** Fastpotify registers for `spotify:` links, so a
   song, album, artist, playlist, or podcast shared from another app opens
   in it, whether it is running or not. `open.spotify.com` addresses go
@@ -127,7 +127,7 @@ sudo dnf install alsa-lib-devel pulseaudio-libs-devel libxkbcommon-devel \
 ```
 
 On Windows, libprojectM is built with Visual Studio 2022, CMake, LLVM, and
-vcpkg (`vcpkg install glew:x64-windows-static-md`, with
+vcpkg (`vcpkg install glew:x64-windows-static`, with
 `VCPKG_INSTALLATION_ROOT` pointing at the vcpkg folder).
 
 With [Nix](https://nixos.org), `nix develop` provides all of it, along with
@@ -160,7 +160,8 @@ The Web API uses a shared app by default. You can add a personal Spotify
 Development Mode app in Settings → Account for a separate quota. Fastpotify
 still uses the shared app for requests that personal apps do not support.
 Playlists the shared app would serve are read over the local playback session
-instead when it is signed in.
+instead when it is signed in. If Spotify stays busy and no personal app is
+configured, Fastpotify points you to that setting at most once a day.
 
 ## Account safety
 
@@ -273,7 +274,7 @@ cargo run --features demo -- --demo --demo-page playlist:pl1 --demo-show queue
 ```
 
 Demo mode never writes settings. `--demo-shot <PATH>` writes the window to a
-PNG and exits, which is how the screenshot above is made.
+PNG and exits, which is useful for reproducible interface screenshots.
 
 ## Contributing
 
