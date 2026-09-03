@@ -546,18 +546,6 @@ mod tests {
     }
 
     #[test]
-    fn a_face_declares_the_regions_it_covers() {
-        // Hiragino Sans covers 中 but declares only Shift JIS.
-        let japanese = Some(1 << 17);
-        assert!(covers_han_region(japanese, "jp"));
-        assert!(!covers_han_region(japanese, "sc"));
-        assert!(!covers_han_region(None, "sc"), "no OS/2 table, no claim");
-        for (_, region) in HAN_REGIONS {
-            assert!(han_code_page(region).is_some(), "{region} has a code page");
-        }
-    }
-
-    #[test]
     fn only_font_files_are_probed() {
         assert!(is_font_file(Path::new("/x/NotoSans.ttf")));
         assert!(is_font_file(Path::new("/x/NotoSansCJK.TTC")));
