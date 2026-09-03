@@ -158,7 +158,9 @@ Premium, and librespot stores a reusable credential for later sessions.
 
 The Web API uses a shared app by default. You can add a personal Spotify
 Development Mode app in Settings → Account for a separate quota. Fastpotify
-still uses the shared app for requests that personal apps do not support.
+still uses the shared app for requests that personal apps do not support, and
+reads playlists other people own over the local playback session when it is
+signed in.
 
 ## Account safety
 

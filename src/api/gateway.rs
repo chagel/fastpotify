@@ -106,19 +106,19 @@ pub enum Route {
     Session,
 }
 
-/// The streaming session answers the playlist reads that would otherwise
-/// spend the shared app's quota. A personal app reads the account's own
-/// playlists faster and with richer fields, so those stay with it.
+/// The streaming session reads the playlists other people own, which no
+/// personal app may read and which would otherwise spend the shared app's
+/// quota. The account's own playlists stay on the Web API: it alone says
+/// whether one is public, which editing its details needs.
 fn route(operation: Operation, personal_ready: bool, session_ready: bool) -> Route {
-    let source = plan(operation, personal_ready);
-    let playlist_read = matches!(
-        operation,
-        Operation::PlaylistMetadata(_) | Operation::PlaylistItems(_)
-    );
-    if session_ready && playlist_read && source == ApiSource::Shared {
-        Route::Session
-    } else {
-        Route::Web(source)
+    match operation {
+        Operation::PlaylistMetadata(access) | Operation::PlaylistItems(access)
+            if session_ready
+                && matches!(access, PlaylistAccess::External | PlaylistAccess::Unknown) =>
+        {
+            Route::Session
+        }
+        _ => Route::Web(plan(operation, personal_ready)),
     }
 }
 
@@ -339,9 +339,18 @@ mod tests {
     }
 
     #[test]
-    fn the_session_takes_the_playlist_reads_the_shared_app_would_get() {
+    fn the_session_reads_other_peoples_playlists() {
         let external = Operation::PlaylistItems(PlaylistAccess::External);
         assert_eq!(route(external, true, true), Route::Session);
+        assert_eq!(
+            route(
+                Operation::PlaylistMetadata(PlaylistAccess::Unknown),
+                false,
+                true
+            ),
+            Route::Session,
+            "a playlist not yet classified is read the same way"
+        );
         assert_eq!(
             route(external, true, false),
             Route::Web(ApiSource::Shared),
@@ -358,8 +367,8 @@ mod tests {
                 false,
                 true
             ),
-            Route::Session,
-            "without one, every playlist read leaves the shared app"
+            Route::Web(ApiSource::Shared),
+            "only the Web API says whether an own playlist is public"
         );
         assert_eq!(
             route(
