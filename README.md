@@ -37,7 +37,13 @@ everyday use, and connection details.
   artists. **Album**, **playlist**, and **podcast** pages support playback
   from any row.
 - **Edit your playlists.** Create, rename, describe, reorder, and delete them.
-  Add songs from a row menu or drag them to a playlist in the sidebar.
+  Add songs from a row menu or drag them to a playlist in the sidebar. A
+  playlist a friend shared with you takes songs too, as Spotify's own apps
+  allow.
+- **Opens Spotify links.** Fastpotify registers for `spotify:` links, so a
+  song, album, artist, playlist, or podcast shared from another app opens
+  in it, whether it is running or not. `open.spotify.com` addresses go
+  through the browser, which hands them to the same handler.
 - **Queue** as a side panel or a page; add anything to it from a row menu.
 - **Resumes the last session.** On startup, the last song is paused where it
   stopped. Play resumes it, and the other playback controls work before it
@@ -55,9 +61,10 @@ everyday use, and connection details.
   this computer, in Settings and in the skin.
 - **MilkDrop.** The visualiser, powered by
   [projectM](https://github.com/projectM-visualizer/projectm), runs in its own
-  window and process. It supports fullscreen and `.milk` presets.
+  window and process. It supports fullscreen and automatically downloads more
+  than 10,000 `.milk` presets on first use (about 26 MB).
 
-  https://github.com/user-attachments/assets/0d408524-2c31-4e43-bd05-73eef3a20f1e
+  https://github.com/user-attachments/assets/12b31312-0e0c-4b34-9383-e8c66aabc58d
 - **Keyboard-first.** Every common action has a shortcut (`Ctrl+/` or `?` lists
   them).
 - **Keeps playing when you close the window.** Fastpotify stays in the system
@@ -92,12 +99,12 @@ brew install --cask crmne/tap/fastpotify
 Everywhere else, build the single binary with Rust 1.95 or newer:
 
 ```bash
-cargo install --path .
+cargo install --path . --locked
 ```
 
 MilkDrop uses libprojectM, which is built from source. This needs CMake, a C++
 compiler, and libclang. To build without MilkDrop or those tools, run
-`cargo install --path . --no-default-features`. On Linux, you also need the
+`cargo install --path . --locked --no-default-features`. On Linux, you also need the
 development packages for ALSA, PulseAudio or PipeWire, and the windowing
 libraries. On Arch:
 
@@ -110,6 +117,13 @@ and on Debian or Ubuntu:
 ```bash
 sudo apt install libasound2-dev libpulse-dev libxkbcommon-dev libwayland-dev \
   cmake clang libclang-dev
+```
+
+and on Fedora:
+
+```bash
+sudo dnf install alsa-lib-devel pulseaudio-libs-devel libxkbcommon-devel \
+  wayland-devel cmake clang libclang-devel
 ```
 
 On Windows, libprojectM is built with Visual Studio 2022, CMake, LLVM, and
@@ -126,6 +140,9 @@ macOS and Windows include common fonts. On Linux, install `noto-fonts` and
 Ubuntu) if titles appear as empty boxes.
 
 A desktop entry is provided in `packaging/applications/fastpotify.desktop`.
+It registers Fastpotify for `spotify:` links; `xdg-mime default
+fastpotify.desktop x-scheme-handler/spotify` makes it the one the desktop
+uses when another Spotify client is installed too.
 
 ## Sign in
 
@@ -212,6 +229,10 @@ marked with `*`. `--raw` prints JSON. The command refreshes the device list,
 so the first call after startup may be empty. Run it again if needed.
 
 A verb exits non-zero when Fastpotify is not running.
+
+On every platform, `fastpotify <link>` opens a Spotify link, a `spotify:`
+URI or an `open.spotify.com` address, in the running app, or starts the
+app on it. This is what the desktop runs when a link is clicked.
 
 Launchers such as Raycast or Alfred can use these commands. The Stream Deck
 plugin uses the same interface.

@@ -163,6 +163,9 @@ pub struct LocalState {
     pub volume: u16,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    /// The librespot engine's Spotify session is alive. Connect device
+    /// activity is separate: Spotify may make this device inactive while the
+    /// session remains ready to be activated by the next load.
     pub connected: bool,
     pub username: String,
     pub active_client: String,
@@ -423,10 +426,12 @@ impl Engine {
         }
     }
 
-    /// Account playlist tree in Spotify order, including folder markers.
-    pub async fn rootlist(&self) -> Result<Vec<RootlistEntry>> {
+    /// Account playlist tree in Spotify order, including folder markers,
+    /// and which of its playlists the account may add songs to.
+    pub async fn rootlist(&self) -> Result<Rootlist> {
         use protobuf::Message as _;
         let mut uris = Vec::new();
+        let mut editable = std::collections::BTreeSet::new();
         let mut from = 0usize;
         loop {
             let bytes = self
@@ -444,13 +449,17 @@ impl Engine {
             };
             let count = contents.items.len();
             let truncated = contents.truncated();
+            editable.extend(editable_uris(&contents));
             uris.extend(contents.items.into_iter().filter_map(|item| item.uri));
             if !truncated || count == 0 {
                 break;
             }
             from += count;
         }
-        Ok(parse_rootlist(&uris))
+        Ok(Rootlist {
+            entries: parse_rootlist(&uris),
+            editable,
+        })
     }
 
     /// The display name behind a user id, from the profile view Spotify's
@@ -708,17 +717,20 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
                 track_id.to_uri().unwrap_or_default()
             )),
         ),
+        PlayerEvent::AudioKeyUnavailable { .. } => set(
+            &mut state.error,
+            Some("Spotify refused the audio key. Try again later".into()),
+        ),
         PlayerEvent::VolumeChanged { volume } => set(&mut state.volume, volume),
         PlayerEvent::SessionConnected { user_name, .. } => {
             let mut changed = set(&mut state.connected, true);
             changed |= set(&mut state.username, user_name);
             changed
         }
-        PlayerEvent::SessionDisconnected { .. } => {
-            let mut changed = set(&mut state.connected, false);
-            changed |= set(&mut state.active_client, String::new());
-            changed
-        }
+        // In librespot this event means the Connect device became inactive,
+        // usually because another device took over. The engine session is
+        // still alive, and `Load` activates it again before starting a track.
+        PlayerEvent::SessionDisconnected { .. } => set(&mut state.active_client, String::new()),
         PlayerEvent::SessionClientChanged { client_name, .. } => {
             set(&mut state.active_client, client_name)
         }
@@ -777,6 +789,32 @@ fn local_track(item: &AudioItem) -> LocalTrack {
         duration_ms: item.duration_ms,
         is_episode,
     }
+}
+
+/// The account's playlist tree, and what Spotify lets the account do to
+/// the playlists in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rootlist {
+    /// The rows in Spotify's order, folder markers included.
+    pub entries: Vec<RootlistEntry>,
+    /// Playlists the account may add songs to, by URI, as Spotify's own
+    /// permission service decorates the rootlist. The Web API's
+    /// `collaborative` flag stays false for a playlist shared by
+    /// invitation, so this is the only word on those.
+    pub editable: std::collections::BTreeSet<String>,
+}
+
+/// The playlists in one rootlist page the account may add songs to, read
+/// from the `capabilities` Spotify puts beside each row.
+pub fn editable_uris(
+    contents: &librespot_protocol::playlist4_external::ListItems,
+) -> impl Iterator<Item = String> + '_ {
+    contents
+        .items
+        .iter()
+        .zip(&contents.meta_items)
+        .filter(|(_, meta)| meta.capabilities.can_edit_items())
+        .filter_map(|(item, _)| item.uri.clone())
 }
 
 /// One row of the account's playlist tree.
@@ -885,6 +923,43 @@ mod tests {
         assert_eq!(rows.len(), 9);
     }
 
+    /// A playlist shared by invitation is editable by Spotify's word in the
+    /// rootlist, never by the Web API's collaborative flag.
+    #[test]
+    fn the_rootlist_says_which_playlists_take_songs() {
+        use librespot_protocol::playlist_permission::Capabilities;
+        use librespot_protocol::playlist4_external::{Item, ListItems, MetaItem};
+
+        // #given
+        let mut contents = ListItems::new();
+        for (uri, can_edit) in [
+            ("spotify:playlist:mine", Some(true)),
+            ("spotify:playlist:theirs", Some(false)),
+            ("spotify:playlist:shared", Some(true)),
+            ("spotify:playlist:undecorated", None),
+        ] {
+            let mut item = Item::new();
+            item.set_uri(uri.to_string());
+            contents.items.push(item);
+            let mut meta = MetaItem::new();
+            if let Some(can_edit) = can_edit {
+                let mut capabilities = Capabilities::new();
+                capabilities.set_can_edit_items(can_edit);
+                meta.capabilities = protobuf::MessageField::some(capabilities);
+            }
+            contents.meta_items.push(meta);
+        }
+
+        // #when
+        let editable: Vec<String> = editable_uris(&contents).collect();
+
+        // #then
+        assert_eq!(
+            editable,
+            ["spotify:playlist:mine", "spotify:playlist:shared"]
+        );
+    }
+
     use super::*;
     use librespot_core::SpotifyUri;
 
@@ -920,6 +995,47 @@ mod tests {
             },
         );
         assert_eq!(state.playback, Playback::Playing);
+    }
+
+    /// Spotify making this Connect device inactive must not be mistaken for
+    /// the engine session ending. A later playlist load can activate the same
+    /// Spirc instance; marking it disconnected makes the UI hold that load
+    /// forever while waiting for a reconnect that will never happen.
+    #[test]
+    fn an_inactive_connect_device_keeps_its_engine_session() {
+        let mut state = LocalState {
+            connected: true,
+            active_client: "Fastpotify".into(),
+            ..LocalState::default()
+        };
+
+        assert!(apply_event(
+            &mut state,
+            PlayerEvent::SessionDisconnected {
+                connection_id: "connection".into(),
+                user_name: "listener".into(),
+            },
+        ));
+
+        assert!(state.connected, "the Spotify session is still usable");
+        assert!(state.active_client.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_audio_key_has_its_own_error() {
+        let mut state = LocalState::default();
+
+        assert!(apply_event(
+            &mut state,
+            PlayerEvent::AudioKeyUnavailable {
+                play_request_id: 1,
+                track_id: uri(),
+            },
+        ));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Spotify refused the audio key. Try again later")
+        );
     }
 
     #[test]

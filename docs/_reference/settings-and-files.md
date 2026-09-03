@@ -21,7 +21,7 @@ Fastpotify follows each platform's conventions. On Linux:
 | Audio cache | `~/.cache/fastpotify/audio/` | Always |
 | Artwork cache | `~/.cache/fastpotify/art/` | Always |
 | Lyrics cache | `~/.cache/fastpotify/lyrics/` | Always |
-| Account-scoped playlist cache | `~/.cache/fastpotify/playlists/<account-id>/` | Always |
+| Account-scoped playlist page cache | `~/.cache/fastpotify/playlists/<account-id>/` | Always |
 | Last run's log | `~/.local/state/fastpotify/fastpotify.log` | Always |
 | Crash log | `~/.local/state/fastpotify/panic.log` | Always |
 
@@ -29,6 +29,16 @@ Clearing caches never signs you out; credentials live in *state*, not
 *cache*. Web API token files are written with owner-only permissions.
 Signing out from Settings deletes both Web API grants and the separate
 playback credential.
+
+Progress through a playlist is periodically cached as a contiguous prefix.
+When the playlist has not changed on Spotify, reopening it resumes from that
+prefix instead of requesting the same pages again. Fastpotify validates the
+cache against Spotify's playlist snapshot before showing it.
+
+Large playlist pages also have a **Go to song** control. Entering a song
+number loads its 50-item page directly, without requesting every earlier page.
+Filtering or sorting still covers the whole playlist, so either action returns
+to the beginning and loads the remaining pages as needed.
 
 On macOS, settings, state, and the logs are in
 `~/Library/Application Support/me.paolino.fastpotify` and the caches in
@@ -83,11 +93,17 @@ main fields are:
 ## Command line
 
 ```
-fastpotify [OPTIONS]
+fastpotify [OPTIONS] [LINK]
 
+  LINK                  A Spotify link to open: spotify:track:…, or an
+                        open.spotify.com address
   --device-name <NAME>  Spotify Connect name for this session
   -v, --verbose         More logs from librespot and the API client
 ```
+
+A link goes to the running Fastpotify when there is one, which then opens
+the page and brings its window forward; otherwise the app starts on it. The
+desktop's handler for `spotify:` links runs exactly this.
 
 Attach `fastpotify.log` from the state directory to bug reports. It contains
 the last run's output, including extra lines from `fastpotify -v`. After a
