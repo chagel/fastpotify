@@ -658,7 +658,9 @@ pub enum Dialog {
         id: String,
         name: String,
         description: String,
-        public: bool,
+        /// `None` while nothing has said whether the playlist is public;
+        /// left untouched on save unless the switch is used.
+        public: Option<bool>,
     },
     ConfirmDeletePlaylist {
         id: String,
@@ -774,7 +776,7 @@ pub enum Action {
         id: String,
         name: String,
         description: String,
-        public: bool,
+        public: Option<bool>,
     },
     DeletePlaylist(String),
     Transfer(String),
