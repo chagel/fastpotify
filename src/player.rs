@@ -490,6 +490,11 @@ impl Engine {
             .map(str::to_string)
     }
 
+    /// The streaming session, for reads that need no Web API quota.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     pub fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
