@@ -791,6 +791,16 @@ impl App {
         self.user.as_ref().map(|user| user.id.as_str())
     }
 
+    /// Whether the library list says a playlist is public.
+    pub fn library_public(&self, id: &str) -> Option<bool> {
+        self.library
+            .playlists
+            .get()?
+            .iter()
+            .find(|playlist| playlist.id == id)?
+            .public
+    }
+
     pub fn is_saved(&self, uri: &str) -> Option<bool> {
         let exact = self.saved.get(uri).copied();
         if exact == Some(true)
@@ -3787,6 +3797,23 @@ impl App {
                         for playlist in playlists {
                             self.saved.insert(playlist.uri.clone(), true);
                         }
+                        // A header read over the streaming session carries
+                        // no public flag; pages that arrived before the list
+                        // take it now.
+                        let public: Vec<(String, bool)> = playlists
+                            .iter()
+                            .filter_map(|playlist| Some((playlist.id.clone(), playlist.public?)))
+                            .collect();
+                        for (id, public) in public {
+                            if let Some(playlist) = self
+                                .playlist_pages
+                                .get_mut(&id)
+                                .and_then(|page| page.playlist.get_mut())
+                                && playlist.public.is_none()
+                            {
+                                playlist.public = Some(public);
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -3800,7 +3827,7 @@ impl App {
             ApiResponse::Playlist {
                 id,
                 generation,
-                result,
+                mut result,
             } => {
                 if self
                     .playlist_pages
@@ -3835,10 +3862,15 @@ impl App {
                     }
                     return;
                 }
-                if let Ok(playlist) = &result
-                    && let Some(image) = pick_image(&playlist.images, 300)
-                {
-                    self.tint_for(Some(image));
+                if let Ok(playlist) = &mut result {
+                    if let Some(image) = pick_image(&playlist.images, 300) {
+                        self.tint_for(Some(image));
+                    }
+                    // The streaming session does not say whether a playlist
+                    // is public; the library list, from the Web API, does.
+                    if playlist.public.is_none() {
+                        playlist.public = self.library_public(&id);
+                    }
                 }
                 if let Some(page) = self.playlist_pages.get_mut(&id) {
                     let old_snapshot = page
@@ -6099,7 +6131,7 @@ impl App {
                     id,
                     name: Some(name),
                     description: Some(description),
-                    public: Some(public),
+                    public,
                 });
             }
             Action::DeletePlaylist(id) => {
@@ -7565,6 +7597,103 @@ mod tests {
         assert_eq!(
             app.playing_context_uri().as_deref(),
             Some("spotify:playlist:phone")
+        );
+    }
+
+    /// A header read over the streaming session carries no public flag,
+    /// and the edit dialog fills its switch from it, so the library list's
+    /// answer stands in.
+    #[test]
+    fn a_header_without_a_public_flag_takes_the_library_lists() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.library.playlists = Loadable::Loaded(vec![Playlist {
+            id: "pl1".into(),
+            public: Some(true),
+            ..Playlist::default()
+        }]);
+        app.playlist_pages.insert(
+            "pl1".into(),
+            PlaylistPage {
+                generation: 1,
+                ..Default::default()
+            },
+        );
+        app.handle_api(ApiResponse::Playlist {
+            id: "pl1".into(),
+            generation: 1,
+            result: Ok(Playlist {
+                id: "pl1".into(),
+                name: "Mine".into(),
+                ..Playlist::default()
+            }),
+        });
+        let playlist = app.playlist_pages["pl1"].playlist.get().unwrap();
+        assert_eq!(playlist.public, Some(true));
+        assert_eq!(playlist.name, "Mine", "the rest is Spotify's answer");
+
+        // Spotify's own answer outranks the list, and a playlist the list
+        // does not hold stays unknown rather than guessed.
+        app.handle_api(ApiResponse::Playlist {
+            id: "pl1".into(),
+            generation: 1,
+            result: Ok(Playlist {
+                id: "pl1".into(),
+                public: Some(false),
+                ..Playlist::default()
+            }),
+        });
+        assert_eq!(
+            app.playlist_pages["pl1"].playlist.get().unwrap().public,
+            Some(false)
+        );
+        app.playlist_pages.insert(
+            "pl2".into(),
+            PlaylistPage {
+                generation: 1,
+                ..Default::default()
+            },
+        );
+        app.handle_api(ApiResponse::Playlist {
+            id: "pl2".into(),
+            generation: 1,
+            result: Ok(Playlist {
+                id: "pl2".into(),
+                ..Playlist::default()
+            }),
+        });
+        assert_eq!(
+            app.playlist_pages["pl2"].playlist.get().unwrap().public,
+            None
+        );
+
+        // The list can arrive after the header: the page takes the flag
+        // then, and a flag Spotify already gave stays.
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![
+                    Playlist {
+                        id: "pl1".into(),
+                        public: Some(true),
+                        ..Playlist::default()
+                    },
+                    Playlist {
+                        id: "pl2".into(),
+                        public: Some(true),
+                        ..Playlist::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        });
+        assert_eq!(
+            app.playlist_pages["pl2"].playlist.get().unwrap().public,
+            Some(true)
+        );
+        assert_eq!(
+            app.playlist_pages["pl1"].playlist.get().unwrap().public,
+            Some(false)
         );
     }
 
