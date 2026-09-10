@@ -80,27 +80,39 @@ pub async fn items(
     let rows = rows(&list, offset, limit);
     let playables = metadata(session, rows.iter().map(|row| &row.id)).await?;
     let items = rows.iter().map(|row| item(row, &playables)).collect();
-    Ok(page(items, total(&list), offset, limit))
+    page(items, total(&list), offset, limit)
 }
 
-/// The rows at `offset`, at most `limit` of them, within the rows the list
-/// carries. Those start at the `from` asked for, or at zero should Spotify
-/// send the whole list.
+/// The rows at `offset`, at most `limit` of them; see [`range`].
 fn rows(list: &SessionPlaylist, offset: u32, limit: u32) -> &[SessionRow] {
     let contents = &list.contents;
     &contents.items[range(contents.items.len(), contents.position, offset, limit)]
 }
 
 /// A page as the Web API shapes one; `next` is only ever tested for
-/// presence, and is there while rows remain beyond this page.
-fn page(items: Vec<PlaylistItem>, total: u32, offset: u32, limit: u32) -> Page<PlaylistItem> {
-    Page {
+/// presence, and is there while rows remain beyond this page. A window
+/// Spotify cut short of the rows that remain is refused rather than paged
+/// past, since the next page would start after rows nobody was shown.
+fn page(
+    items: Vec<PlaylistItem>,
+    total: u32,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<PlaylistItem>, Failure> {
+    let shown = offset.saturating_add(items.len() as u32);
+    if (items.len() as u32) < limit && shown < total {
+        return Err(Failure::Retry(anyhow::anyhow!(
+            "window at {offset} answered {} rows of {total}",
+            items.len()
+        )));
+    }
+    Ok(Page {
         items,
         total,
         limit,
         offset,
-        next: (offset.saturating_add(limit) < total).then(String::new),
-    }
+        next: (shown < total).then(String::new),
+    })
 }
 
 /// The display name behind a user id, from the profile view Spotify's
@@ -289,20 +301,26 @@ async fn metadata(
     session: &Session,
     uris: impl Iterator<Item = &SpotifyUri>,
 ) -> Result<HashMap<String, PlayableItem>, Failure> {
-    let request = batch(uris);
-    if request.entity_request.is_empty() {
+    let (request, asked) = batch(uris);
+    if asked.is_empty() {
         return Ok(HashMap::new());
     }
+    // A refusal here is the metadata endpoint's, not the playlist's; the
+    // Web API may still have the rows.
     let response = session
         .spclient()
-        .get_extended_metadata(request.clone())
-        .await?;
-    answers(&request, response)
+        .get_extended_metadata(request)
+        .await
+        .map_err(|error| Failure::Retry(error.into()))?;
+    answers(&asked, response)
 }
 
-/// One request for the details of every track and episode among `uris`.
-/// A playlist can hold the same song twice; it is asked for once.
-fn batch<'a>(uris: impl Iterator<Item = &'a SpotifyUri>) -> BatchedEntityRequest {
+/// One request for the details of every track and episode among `uris`,
+/// with the URIs it asks for. A playlist can hold the same song twice; it
+/// is asked for once.
+fn batch<'a>(
+    uris: impl Iterator<Item = &'a SpotifyUri>,
+) -> (BatchedEntityRequest, BTreeSet<String>) {
     let mut request = BatchedEntityRequest::new();
     let mut asked = BTreeSet::new();
     for uri in uris {
@@ -326,29 +344,26 @@ fn batch<'a>(uris: impl Iterator<Item = &'a SpotifyUri>) -> BatchedEntityRequest
             ..Default::default()
         });
     }
-    request
+    (request, asked)
 }
 
-/// The details Spotify answered `request` with, by URI. Spotify marks each
+/// The details Spotify answered with for the URIs `asked`, by URI. Spotify marks each
 /// answer: a 404 is a song it no longer has, which the Web API also shows
 /// as a row without one. Any other refusal, a provider error over the whole
 /// batch, bytes that do not read as a song, or a URI left unanswered is a
 /// retry, since a page cached without those songs would stay wrong. Kinds
 /// the request never asked for are passed over.
 fn answers(
-    request: &BatchedEntityRequest,
+    asked: &BTreeSet<String>,
     response: BatchedExtensionResponse,
 ) -> Result<HashMap<String, PlayableItem>, Failure> {
     let retry = |reason: String| Failure::Retry(anyhow::anyhow!(reason));
-    let mut unanswered: BTreeSet<&str> = request
-        .entity_request
-        .iter()
-        .map(|entity| entity.entity_uri.as_str())
-        .collect();
+    let mut unanswered: BTreeSet<&str> = asked.iter().map(String::as_str).collect();
     let mut playables = HashMap::new();
     for array in response.extended_metadata {
+        // Spotify marks a batch it answered with 200, as it does each row.
         let provider = array.header.provider_error_status;
-        if provider != 0 {
+        if !matches!(provider, 0 | 200) {
             return Err(retry(format!("metadata provider answered {provider}")));
         }
         let kind = match array.extension_kind.enum_value() {
@@ -704,6 +719,10 @@ mod tests {
         assert_eq!(track.disc_number, Some(1));
         assert!(track.explicit, "the E badge");
         assert_eq!(track.popularity, Some(100), "held to the Web API's range");
+        assert_eq!(
+            track.is_playable, None,
+            "the session says nothing of the market"
+        );
         assert_eq!(track.artist_names(), "Rick Astley");
         assert_eq!(
             track.artists[0].uri.as_deref(),
@@ -800,18 +819,22 @@ mod tests {
     /// app's paged list reads them.
     #[test]
     fn a_page_ends_where_the_list_does() {
-        assert_eq!(page(Vec::new(), 170, 100, 50).next_offset(), Some(150));
-        assert_eq!(page(Vec::new(), 170, 150, 50).next_offset(), None);
-        assert_eq!(
-            page(Vec::new(), 0, 0, 50).next_offset(),
-            None,
-            "an empty list"
-        );
-        assert_eq!(
-            page(Vec::new(), 170, 500, 50).next_offset(),
-            None,
-            "past the end"
-        );
+        let full = |count: usize| vec![PlaylistItem::default(); count];
+        let next = |items, total, offset| page(items, total, offset, 50).unwrap().next_offset();
+        assert_eq!(next(full(50), 170, 100), Some(150));
+        assert_eq!(next(full(20), 170, 150), None, "the last, short page");
+        assert_eq!(next(Vec::new(), 0, 0), None, "an empty list");
+        assert_eq!(next(Vec::new(), 170, 500), None, "past the end");
+    }
+
+    /// A window cut short while rows remain is refused, so the Web API
+    /// pages it rather than the next page starting past rows never shown.
+    #[test]
+    fn a_short_window_is_not_paged_past() {
+        let short = page(vec![PlaylistItem::default(); 30], 500, 0, 50).unwrap_err();
+        assert!(matches!(short, Failure::Retry(_)), "{short:?}");
+        assert!(format!("{short:?}").contains("30 rows of 500"));
+        assert!(page(Vec::new(), 500, 0, 50).is_err(), "nothing at all");
     }
 
     #[test]
@@ -876,7 +899,8 @@ mod tests {
             SpotifyUri::from_uri("spotify:local:Artist:Album:Song:180").unwrap(),
             SpotifyUri::from_uri("spotify:album:4uLU6hMCjMI75M1A2tKUQC").unwrap(),
         ];
-        let request = batch(uris.iter());
+        let (request, uris_asked) = batch(uris.iter());
+        assert_eq!(uris_asked.len(), request.entity_request.len());
         let asked: Vec<(&str, ExtensionKind)> = request
             .entity_request
             .iter()
@@ -894,7 +918,7 @@ mod tests {
                 (EPISODE, ExtensionKind::EPISODE_V4)
             ]
         );
-        assert!(batch([].iter()).entity_request.is_empty());
+        assert!(batch([].iter()).1.is_empty());
     }
 
     /// One answer in Spotify's batch: the kind it is for, the URI, the code
@@ -934,12 +958,12 @@ mod tests {
         episode.write_to_bytes().unwrap()
     }
 
-    fn asked(uris: &[&str]) -> BatchedEntityRequest {
+    fn asked(uris: &[&str]) -> BTreeSet<String> {
         let uris: Vec<_> = uris
             .iter()
             .map(|uri| SpotifyUri::from_uri(uri).unwrap())
             .collect();
-        batch(uris.iter())
+        batch(uris.iter()).1
     }
 
     fn response(
@@ -952,14 +976,17 @@ mod tests {
         response
     }
 
-    /// Spotify's answer is read by URI and kind, whether or not it marks
-    /// each answer with a code; a kind this does not read is passed over.
+    /// Spotify's answer is read by URI and kind, whether it marks the batch
+    /// and each answer with 200 or leaves them unmarked; a kind this does
+    /// not read is passed over.
     #[test]
     fn an_answer_is_read_by_uri_and_kind() {
+        let mut marked = answer(ExtensionKind::TRACK_V4, TRACK, 200, Some(track_bytes()));
+        marked.header.mut_or_insert_default().provider_error_status = 200;
         let playables = answers(
             &asked(&[TRACK, EPISODE]),
             response([
-                answer(ExtensionKind::TRACK_V4, TRACK, 200, Some(track_bytes())),
+                marked,
                 answer(
                     ExtensionKind::ALBUM_V4,
                     "spotify:album:x",
