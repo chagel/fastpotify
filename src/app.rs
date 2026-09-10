@@ -3800,18 +3800,14 @@ impl App {
                         // A header read over the streaming session carries
                         // no public flag; pages that arrived before the list
                         // take it now.
-                        let public: Vec<(String, bool)> = playlists
-                            .iter()
-                            .filter_map(|playlist| Some((playlist.id.clone(), playlist.public?)))
-                            .collect();
-                        for (id, public) in public {
+                        for listed in playlists {
                             if let Some(playlist) = self
                                 .playlist_pages
-                                .get_mut(&id)
+                                .get_mut(&listed.id)
                                 .and_then(|page| page.playlist.get_mut())
                                 && playlist.public.is_none()
                             {
-                                playlist.public = Some(public);
+                                playlist.public = listed.public;
                             }
                         }
                     }
@@ -7598,6 +7594,31 @@ mod tests {
             app.playing_context_uri().as_deref(),
             Some("spotify:playlist:phone")
         );
+    }
+
+    /// Saving the edit dialog sends the public flag only when its switch
+    /// was used; a playlist nothing has described keeps whatever it was.
+    #[test]
+    fn saving_playlist_details_leaves_an_unknown_public_flag_alone() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        let save = |app: &mut App, public| {
+            app.apply(
+                Action::UpdatePlaylist {
+                    id: "pl1".into(),
+                    name: "Renamed".into(),
+                    description: String::new(),
+                    public,
+                },
+                &ctx,
+            );
+            match app.backend.take_playlist_add_requests().as_slice() {
+                [ApiRequest::UpdatePlaylist { public, .. }] => *public,
+                sent => panic!("{sent:?}"),
+            }
+        };
+        assert_eq!(save(&mut app, None), None);
+        assert_eq!(save(&mut app, Some(false)), Some(false));
     }
 
     /// A header read over the streaming session carries no public flag,
