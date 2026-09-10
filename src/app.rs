@@ -8,7 +8,7 @@ use egui::Color32;
 
 use crate::api::PlayRequest;
 use crate::api::models::{
-    ArtistRef, Device, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue, Track,
+    ArtistRef, Device, Image, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue, Track,
     TrackCount, User, UserRef, pick_image,
 };
 use crate::backend::{
@@ -803,6 +803,13 @@ impl App {
     /// Whether the library list says a playlist is public.
     pub fn library_public(&self, id: &str) -> Option<bool> {
         self.library_entry(id)?.public
+    }
+
+    /// The cover the library list shows for a playlist, when it holds one.
+    fn library_images(&self, id: &str) -> Vec<Image> {
+        self.library_entry(id)
+            .map(|playlist| playlist.images.clone())
+            .unwrap_or_default()
     }
 
     /// The owner's display name where the Web API gave it: the signed-in
@@ -3816,8 +3823,9 @@ impl App {
                             self.saved.insert(playlist.uri.clone(), true);
                         }
                         // A header read over the streaming session carries
-                        // no public flag and may lack the owner's name;
-                        // pages that arrived before the list take them now.
+                        // no public flag, and may lack the owner's name and
+                        // the cover; pages that arrived before the list
+                        // take them now.
                         for listed in playlists {
                             if let Some(playlist) = self
                                 .playlist_pages
@@ -3829,6 +3837,9 @@ impl App {
                                 }
                                 if playlist.owner.display_name.is_none() {
                                     playlist.owner.display_name = listed.owner.display_name.clone();
+                                }
+                                if playlist.images.is_empty() {
+                                    playlist.images = listed.images.clone();
                                 }
                             }
                         }
@@ -3881,9 +3892,6 @@ impl App {
                     return;
                 }
                 if let Ok(playlist) = &mut result {
-                    if let Some(image) = pick_image(&playlist.images, 300) {
-                        self.tint_for(Some(image));
-                    }
                     // The streaming session does not say whether a playlist
                     // is public; the library list, from the Web API, does.
                     if playlist.public.is_none() {
@@ -3894,6 +3902,14 @@ impl App {
                     if playlist.owner.display_name.is_none() {
                         playlist.owner.display_name =
                             self.known_owner_name(&id, playlist.owner.id.as_deref());
+                    }
+                    // Nor does it carry the mosaic of a playlist without a
+                    // cover of its own; the library list does.
+                    if playlist.images.is_empty() {
+                        playlist.images = self.library_images(&id);
+                    }
+                    if let Some(image) = pick_image(&playlist.images, 300) {
+                        self.tint_for(Some(image));
                     }
                 }
                 if let Some(page) = self.playlist_pages.get_mut(&id) {
@@ -7830,6 +7846,92 @@ mod tests {
         });
         assert_eq!(shown(&app, "pl3"), "Nobody");
         assert_eq!(shown(&app, "pl2"), "Molly");
+    }
+
+    /// The streaming session carries no cover for a playlist without one
+    /// of its own, where the Web API composes a mosaic; the library list
+    /// holds that mosaic, in whichever order the answers arrive.
+    #[test]
+    fn a_header_without_a_cover_takes_the_library_lists() {
+        let cover = |url: &str| {
+            vec![Image {
+                url: url.into(),
+                width: Some(640),
+                height: Some(640),
+            }]
+        };
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.library.playlists = Loadable::Loaded(vec![Playlist {
+            id: "pl1".into(),
+            images: cover("https://mosaic.scdn.co/640/pl1"),
+            ..Playlist::default()
+        }]);
+        for id in ["pl1", "pl2", "pl3"] {
+            app.playlist_pages.insert(
+                id.into(),
+                PlaylistPage {
+                    generation: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        let header = |id: &str, images: Vec<Image>| ApiResponse::Playlist {
+            id: id.into(),
+            generation: 1,
+            result: Ok(Playlist {
+                id: id.into(),
+                images,
+                ..Playlist::default()
+            }),
+        };
+        let shown = |app: &App, id: &str| {
+            app.playlist_pages[id]
+                .playlist
+                .get()
+                .unwrap()
+                .images
+                .iter()
+                .map(|image| image.url.clone())
+                .collect::<Vec<_>>()
+        };
+        app.handle_api(header("pl1", Vec::new()));
+        app.handle_api(header("pl2", cover("https://i.scdn.co/image/own")));
+        app.handle_api(header("pl3", Vec::new()));
+        assert_eq!(
+            shown(&app, "pl1"),
+            ["https://mosaic.scdn.co/640/pl1"],
+            "the library list's mosaic"
+        );
+        assert_eq!(
+            shown(&app, "pl2"),
+            ["https://i.scdn.co/image/own"],
+            "a cover of its own stays"
+        );
+        assert!(shown(&app, "pl3").is_empty(), "nothing to take it from");
+
+        // The list can arrive after the header: the page takes the cover
+        // then, and one the header carried stays.
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![
+                    Playlist {
+                        id: "pl2".into(),
+                        images: cover("https://mosaic.scdn.co/640/pl2"),
+                        ..Playlist::default()
+                    },
+                    Playlist {
+                        id: "pl3".into(),
+                        images: cover("https://mosaic.scdn.co/640/pl3"),
+                        ..Playlist::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        });
+        assert_eq!(shown(&app, "pl3"), ["https://mosaic.scdn.co/640/pl3"]);
+        assert_eq!(shown(&app, "pl2"), ["https://i.scdn.co/image/own"]);
     }
 
     #[test]
