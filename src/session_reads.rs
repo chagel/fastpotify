@@ -348,11 +348,12 @@ fn batch<'a>(
 }
 
 /// The details Spotify answered with for the URIs `asked`, by URI. Spotify marks each
-/// answer: a 404 is a song it no longer has, which the Web API also shows
-/// as a row without one. Any other refusal, a provider error over the whole
-/// batch, bytes that do not read as a song, or a URI left unanswered is a
-/// retry, since a page cached without those songs would stay wrong. Kinds
-/// the request never asked for are passed over.
+/// answer: a 404 is a song it no longer has, a 451 one it withholds for
+/// legal reasons, and the Web API shows both as a row without one. Any
+/// other refusal, a provider error over the whole batch, bytes that do not
+/// read as a song, or a URI left unanswered is a retry, since a page cached
+/// without those songs would stay wrong. Kinds the request never asked for
+/// are passed over.
 fn answers(
     asked: &BTreeSet<String>,
     response: BatchedExtensionResponse,
@@ -374,7 +375,7 @@ fn answers(
             unanswered.remove(data.entity_uri.as_str());
             match data.header.status_code {
                 0 | 200 => {}
-                404 => continue,
+                404 | 451 => continue,
                 code => return Err(retry(format!("{} answered {code}", data.entity_uri))),
             }
             let item = data
@@ -1032,6 +1033,28 @@ mod tests {
         let items: Vec<_> = rows.iter().map(|row| item(row, &playables)).collect();
         assert!(items[0].item.is_some());
         assert!(items[1].item.is_none(), "an empty row, not a dropped one");
+    }
+
+    /// A song Spotify withholds for legal reasons, an episode blocked in
+    /// the account's country, is likewise a row without one: the Web API
+    /// answers `null` for it, and a page that fell back there on its
+    /// account would land on the shared app's quota at every open.
+    #[test]
+    fn a_song_spotify_withholds_leaves_its_row_empty() {
+        let playables = answers(
+            &asked(&[TRACK, EPISODE]),
+            response([
+                answer(ExtensionKind::TRACK_V4, TRACK, 200, Some(track_bytes())),
+                answer(ExtensionKind::EPISODE_V4, EPISODE, 451, None),
+            ]),
+        )
+        .unwrap();
+        assert!(playables.contains_key(TRACK));
+        assert!(!playables.contains_key(EPISODE));
+        let rows = [row(TRACK, "", 0), row(EPISODE, "", 0)];
+        let items: Vec<_> = rows.iter().map(|row| item(row, &playables)).collect();
+        assert!(items[0].item.is_some());
+        assert!(items[1].item.is_none(), "an empty row, not a retried page");
     }
 
     /// One bad answer fails the page, so it is asked for again rather than
