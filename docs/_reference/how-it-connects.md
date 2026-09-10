@@ -95,8 +95,8 @@ does not retry it through the other app. A playlist read the librespot session
 refuses outright, because the playlist is gone or private, is shown as such. A
 dropped connection, a read that takes longer than 30 seconds, or a page whose
 song details Spotify did not supply in full, hands the read to the Web API
-instead of caching rows without songs. A song Spotify no longer has is an
-empty row, as the Web API shows it.
+instead of caching rows without songs. A song Spotify no longer has, or
+withholds for legal reasons, is an empty row, as the Web API shows it.
 
 Spotify can also explicitly refuse the key needed to decrypt a track. When
 that happens, Fastpotify stops local playback and leaves the rest of the queue
