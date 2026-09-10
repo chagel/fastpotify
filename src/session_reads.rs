@@ -282,8 +282,9 @@ fn local_track(id: &SpotifyUri, uri: String) -> Option<PlayableItem> {
 }
 
 /// Track and episode details for the given URIs, in one batched request.
-/// A URI Spotify does not answer for is absent, as the Web API leaves a
-/// row's item empty when it cannot be played.
+/// A URI Spotify says it has no item for is absent, as the Web API leaves
+/// such a row's item empty. An answer Spotify could not give, or one this
+/// cannot read, fails the page rather than pass for rows without songs.
 async fn metadata(
     session: &Session,
     uris: impl Iterator<Item = &SpotifyUri>,
@@ -292,8 +293,11 @@ async fn metadata(
     if request.entity_request.is_empty() {
         return Ok(HashMap::new());
     }
-    let response = session.spclient().get_extended_metadata(request).await?;
-    Ok(playables_of(response))
+    let response = session
+        .spclient()
+        .get_extended_metadata(request.clone())
+        .await?;
+    answers(&request, response)
 }
 
 /// One request for the details of every track and episode among `uris`.
@@ -325,25 +329,51 @@ fn batch<'a>(uris: impl Iterator<Item = &'a SpotifyUri>) -> BatchedEntityRequest
     request
 }
 
-/// The details Spotify answered with, by URI. What it did not answer for,
-/// or answered in a kind this does not read, is absent.
-fn playables_of(response: BatchedExtensionResponse) -> HashMap<String, PlayableItem> {
+/// The details Spotify answered `request` with, by URI. Spotify marks each
+/// answer: a 404 is a song it no longer has, which the Web API also shows
+/// as a row without one. Any other refusal, a provider error over the whole
+/// batch, bytes that do not read as a song, or a URI left unanswered is a
+/// retry, since a page cached without those songs would stay wrong. Kinds
+/// the request never asked for are passed over.
+fn answers(
+    request: &BatchedEntityRequest,
+    response: BatchedExtensionResponse,
+) -> Result<HashMap<String, PlayableItem>, Failure> {
+    let retry = |reason: String| Failure::Retry(anyhow::anyhow!(reason));
+    let mut unanswered: BTreeSet<&str> = request
+        .entity_request
+        .iter()
+        .map(|entity| entity.entity_uri.as_str())
+        .collect();
     let mut playables = HashMap::new();
     for array in response.extended_metadata {
-        let Ok(kind) = array.extension_kind.enum_value() else {
-            continue;
+        let provider = array.header.provider_error_status;
+        if provider != 0 {
+            return Err(retry(format!("metadata provider answered {provider}")));
+        }
+        let kind = match array.extension_kind.enum_value() {
+            Ok(kind @ (ExtensionKind::TRACK_V4 | ExtensionKind::EPISODE_V4)) => kind,
+            _ => continue,
         };
         for data in array.extension_data {
-            if let Some(item) = data
+            unanswered.remove(data.entity_uri.as_str());
+            match data.header.status_code {
+                0 | 200 => {}
+                404 => continue,
+                code => return Err(retry(format!("{} answered {code}", data.entity_uri))),
+            }
+            let item = data
                 .extension_data
                 .as_ref()
                 .and_then(|any| playable(kind, &any.value))
-            {
-                playables.insert(data.entity_uri, item);
-            }
+                .ok_or_else(|| retry(format!("unreadable metadata for {}", data.entity_uri)))?;
+            playables.insert(data.entity_uri, item);
         }
     }
-    playables
+    if let Some(uri) = unanswered.first() {
+        return Err(retry(format!("no metadata answer for {uri}")));
+    }
+    Ok(playables)
 }
 
 fn playable(kind: ExtensionKind, bytes: &[u8]) -> Option<PlayableItem> {
@@ -867,54 +897,79 @@ mod tests {
         assert!(batch([].iter()).entity_request.is_empty());
     }
 
-    /// Spotify's answer is read by URI and kind; a kind this does not read,
-    /// an empty answer, and bytes that are not a track are left out.
-    #[test]
-    fn an_answer_is_read_by_uri_and_kind() {
+    /// One answer in Spotify's batch: the kind it is for, the URI, the code
+    /// Spotify marks it with, and the bytes it carries, if any.
+    fn answer(
+        kind: ExtensionKind,
+        uri: &str,
+        status: i32,
+        bytes: Option<Vec<u8>>,
+    ) -> librespot_protocol::extended_metadata::EntityExtensionDataArray {
         use librespot_protocol::entity_extension_data::EntityExtensionData;
         use librespot_protocol::extended_metadata::EntityExtensionDataArray;
+        let mut array = EntityExtensionDataArray::new();
+        array.extension_kind = EnumOrUnknown::new(kind);
+        let mut data = EntityExtensionData::new();
+        data.entity_uri = uri.into();
+        data.header.mut_or_insert_default().status_code = status;
+        if let Some(bytes) = bytes {
+            data.extension_data.mut_or_insert_default().value = bytes;
+        }
+        array.extension_data.push(data);
+        array
+    }
+
+    fn track_bytes() -> Vec<u8> {
         let mut track = librespot_protocol::metadata::Track::new();
         track.set_gid(GID.to_vec());
         track.set_name("Never Gonna Give You Up".into());
         track.album.mut_or_insert_default().set_gid(vec![0x03; 16]);
-        let answer = |kind: ExtensionKind, uri: &str, bytes: Option<Vec<u8>>| {
-            let mut array = EntityExtensionDataArray::new();
-            array.extension_kind = EnumOrUnknown::new(kind);
-            let mut data = EntityExtensionData::new();
-            data.entity_uri = uri.into();
-            if let Some(bytes) = bytes {
-                data.extension_data.mut_or_insert_default().value = bytes;
-            }
-            array.extension_data.push(data);
-            array
-        };
+        track.write_to_bytes().unwrap()
+    }
+
+    fn episode_bytes() -> Vec<u8> {
         let mut episode = librespot_protocol::metadata::Episode::new();
         episode.set_gid(vec![0x05; 16]);
         episode.set_name("Episode 1".into());
-        let bytes = track.write_to_bytes().unwrap();
-        let mut response = BatchedExtensionResponse::new();
-        response.extended_metadata.push(answer(
-            ExtensionKind::TRACK_V4,
-            TRACK,
-            Some(bytes.clone()),
-        ));
-        response.extended_metadata.push(answer(
-            ExtensionKind::ALBUM_V4,
-            "spotify:album:x",
-            Some(bytes.clone()),
-        ));
-        response.extended_metadata.push(answer(
-            ExtensionKind::TRACK_V4,
-            "spotify:track:empty",
-            None,
-        ));
-        response.extended_metadata.push(answer(
-            ExtensionKind::EPISODE_V4,
-            EPISODE,
-            Some(episode.write_to_bytes().unwrap()),
-        ));
+        episode.write_to_bytes().unwrap()
+    }
 
-        let playables = playables_of(response);
+    fn asked(uris: &[&str]) -> BatchedEntityRequest {
+        let uris: Vec<_> = uris
+            .iter()
+            .map(|uri| SpotifyUri::from_uri(uri).unwrap())
+            .collect();
+        batch(uris.iter())
+    }
+
+    fn response(
+        arrays: impl IntoIterator<
+            Item = librespot_protocol::extended_metadata::EntityExtensionDataArray,
+        >,
+    ) -> BatchedExtensionResponse {
+        let mut response = BatchedExtensionResponse::new();
+        response.extended_metadata.extend(arrays);
+        response
+    }
+
+    /// Spotify's answer is read by URI and kind, whether or not it marks
+    /// each answer with a code; a kind this does not read is passed over.
+    #[test]
+    fn an_answer_is_read_by_uri_and_kind() {
+        let playables = answers(
+            &asked(&[TRACK, EPISODE]),
+            response([
+                answer(ExtensionKind::TRACK_V4, TRACK, 200, Some(track_bytes())),
+                answer(
+                    ExtensionKind::ALBUM_V4,
+                    "spotify:album:x",
+                    200,
+                    Some(track_bytes()),
+                ),
+                answer(ExtensionKind::EPISODE_V4, EPISODE, 0, Some(episode_bytes())),
+            ]),
+        )
+        .unwrap();
         assert_eq!(
             playables.len(),
             2,
@@ -929,6 +984,79 @@ mod tests {
             playables.get(EPISODE),
             Some(PlayableItem::Episode(_))
         ));
+    }
+
+    /// A song Spotify no longer has is a row without one, as the Web API
+    /// shows it, and the rest of the page keeps its songs.
+    #[test]
+    fn a_song_spotify_no_longer_has_leaves_its_row_empty() {
+        let gone = "spotify:track:0000000000000000000001";
+        let playables = answers(
+            &asked(&[TRACK, gone]),
+            response([
+                answer(ExtensionKind::TRACK_V4, TRACK, 200, Some(track_bytes())),
+                answer(ExtensionKind::TRACK_V4, gone, 404, None),
+            ]),
+        )
+        .unwrap();
+        assert!(playables.contains_key(TRACK));
+        assert!(!playables.contains_key(gone));
+        let rows = [row(TRACK, "", 0), row(gone, "", 0)];
+        let items: Vec<_> = rows.iter().map(|row| item(row, &playables)).collect();
+        assert!(items[0].item.is_some());
+        assert!(items[1].item.is_none(), "an empty row, not a dropped one");
+    }
+
+    /// One bad answer fails the page, so it is asked for again rather than
+    /// cached without the song: Spotify refusing the song for any reason
+    /// other than not having it, its provider failing the whole batch,
+    /// bytes that do not read as a song, and a song it never answered for.
+    #[test]
+    fn a_partly_failed_batch_is_retried_not_cached_with_empty_rows() {
+        let good = || answer(ExtensionKind::TRACK_V4, TRACK, 200, Some(track_bytes()));
+        let retried = |arrays: Vec<_>| {
+            let failure = answers(&asked(&[TRACK, EPISODE]), response(arrays)).unwrap_err();
+            assert!(matches!(failure, Failure::Retry(_)), "{failure:?}");
+            failure
+        };
+
+        let refused = retried(vec![
+            good(),
+            answer(ExtensionKind::EPISODE_V4, EPISODE, 500, None),
+        ]);
+        assert!(format!("{refused:?}").contains("500"));
+
+        let mut failed = answer(
+            ExtensionKind::EPISODE_V4,
+            EPISODE,
+            200,
+            Some(episode_bytes()),
+        );
+        failed.header.mut_or_insert_default().provider_error_status = 503;
+        retried(vec![good(), failed]);
+
+        retried(vec![
+            good(),
+            answer(
+                ExtensionKind::EPISODE_V4,
+                EPISODE,
+                200,
+                Some(b"not an episode".to_vec()),
+            ),
+        ]);
+        retried(vec![
+            good(),
+            answer(ExtensionKind::EPISODE_V4, EPISODE, 200, None),
+        ]);
+
+        let unanswered = retried(vec![good()]);
+        assert!(format!("{unanswered:?}").contains(EPISODE));
+    }
+
+    /// Bytes that are not the kind asked for read as nothing.
+    #[test]
+    fn bytes_of_the_wrong_kind_read_as_nothing() {
         assert!(playable(ExtensionKind::TRACK_V4, b"not a track").is_none());
+        assert!(playable(ExtensionKind::ALBUM_V4, &track_bytes()).is_none());
     }
 }

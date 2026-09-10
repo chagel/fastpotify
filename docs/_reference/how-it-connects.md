@@ -92,8 +92,10 @@ and dragging never write that order back to Spotify.
 Each Web API session has separate concurrency and rate limits. A `Retry-After`
 response pauses only that session. Fastpotify routes each request once and
 does not retry it through the other app. A playlist read the librespot session
-refuses outright, because the playlist is gone or private, is shown as such;
-only a dropped connection hands the read to the Web API.
+refuses outright, because the playlist is gone or private, is shown as such. A
+dropped connection, or a page whose song details Spotify did not supply in
+full, hands the read to the Web API instead of caching rows without songs. A
+song Spotify no longer has is an empty row, as the Web API shows it.
 
 Spotify can also explicitly refuse the key needed to decrypt a track. When
 that happens, Fastpotify stops local playback and leaves the rest of the queue
