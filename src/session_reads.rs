@@ -60,11 +60,11 @@ impl From<librespot_core::Error> for Failure {
 pub async fn playlist(session: &Session, id: &str) -> Result<Playlist, Failure> {
     let list = window(session, id, 0, 0).await?;
     let mut playlist = header(id, &list);
-    // `Playlist::owner_name` already reads a missing name as Spotify's.
+    // `Playlist::owner_name` reads a missing name as Spotify's for its own
+    // lists and as the id for anyone else's, until the app finds the name
+    // where the Web API gave it: the account's own, or the library list.
     if let Some(owner) = playlist.owner.id.clone().filter(|owner| owner != "spotify") {
-        // The Web API always names the owner; failing that, the id is
-        // better than "Spotify".
-        playlist.owner.display_name = user_display_name(session, &owner).await.or(Some(owner));
+        playlist.owner.display_name = user_display_name(session, &owner).await;
     }
     Ok(playlist)
 }
