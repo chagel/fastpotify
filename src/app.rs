@@ -791,14 +791,32 @@ impl App {
         self.user.as_ref().map(|user| user.id.as_str())
     }
 
-    /// Whether the library list says a playlist is public.
-    pub fn library_public(&self, id: &str) -> Option<bool> {
+    /// The library list's entry for a playlist, when it holds one.
+    fn library_entry(&self, id: &str) -> Option<&Playlist> {
         self.library
             .playlists
             .get()?
             .iter()
-            .find(|playlist| playlist.id == id)?
-            .public
+            .find(|playlist| playlist.id == id)
+    }
+
+    /// Whether the library list says a playlist is public.
+    pub fn library_public(&self, id: &str) -> Option<bool> {
+        self.library_entry(id)?.public
+    }
+
+    /// The owner's display name where the Web API gave it: the signed-in
+    /// account's own, or the library list's for a playlist it holds.
+    pub fn known_owner_name(&self, id: &str, owner: Option<&str>) -> Option<String> {
+        if let Some(user) = self
+            .user
+            .as_ref()
+            .filter(|user| Some(user.id.as_str()) == owner)
+            && let Some(name) = user.display_name.clone()
+        {
+            return Some(name);
+        }
+        self.library_entry(id)?.owner.display_name.clone()
     }
 
     pub fn is_saved(&self, uri: &str) -> Option<bool> {
@@ -3798,16 +3816,20 @@ impl App {
                             self.saved.insert(playlist.uri.clone(), true);
                         }
                         // A header read over the streaming session carries
-                        // no public flag; pages that arrived before the list
-                        // take it now.
+                        // no public flag and may lack the owner's name;
+                        // pages that arrived before the list take them now.
                         for listed in playlists {
                             if let Some(playlist) = self
                                 .playlist_pages
                                 .get_mut(&listed.id)
                                 .and_then(|page| page.playlist.get_mut())
-                                && playlist.public.is_none()
                             {
-                                playlist.public = listed.public;
+                                if playlist.public.is_none() {
+                                    playlist.public = listed.public;
+                                }
+                                if playlist.owner.display_name.is_none() {
+                                    playlist.owner.display_name = listed.owner.display_name.clone();
+                                }
                             }
                         }
                     }
@@ -3866,6 +3888,12 @@ impl App {
                     // is public; the library list, from the Web API, does.
                     if playlist.public.is_none() {
                         playlist.public = self.library_public(&id);
+                    }
+                    // Nor does it always name the owner; the account's own
+                    // name and the library list, both from the Web API, do.
+                    if playlist.owner.display_name.is_none() {
+                        playlist.owner.display_name =
+                            self.known_owner_name(&id, playlist.owner.id.as_deref());
                     }
                 }
                 if let Some(page) = self.playlist_pages.get_mut(&id) {
@@ -7716,6 +7744,92 @@ mod tests {
             app.playlist_pages["pl1"].playlist.get().unwrap().public,
             Some(false)
         );
+    }
+
+    /// The streaming session does not always name a playlist's owner. The
+    /// account's own name stands in for its own lists, the library list's
+    /// for the rest it holds, in whichever order the answers arrive, and
+    /// a name Spotify gave stays.
+    #[test]
+    fn a_header_without_an_owner_name_takes_a_known_one() {
+        use crate::api::models::{Owner, User};
+        let owned_by = |id: &str, name: Option<&str>| Owner {
+            id: Some(id.into()),
+            display_name: name.map(str::to_string),
+            uri: None,
+        };
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.user = Some(User {
+            id: "me".into(),
+            display_name: Some("Mine".into()),
+            ..User::default()
+        });
+        app.library.playlists = Loadable::Loaded(vec![Playlist {
+            id: "pl2".into(),
+            owner: owned_by("other", Some("Molly C.")),
+            ..Playlist::default()
+        }]);
+        for id in ["pl1", "pl2", "pl3"] {
+            app.playlist_pages.insert(
+                id.into(),
+                PlaylistPage {
+                    generation: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        let header = |id: &str, owner: Owner| ApiResponse::Playlist {
+            id: id.into(),
+            generation: 1,
+            result: Ok(Playlist {
+                id: id.into(),
+                owner,
+                ..Playlist::default()
+            }),
+        };
+        let shown = |app: &App, id: &str| {
+            app.playlist_pages[id]
+                .playlist
+                .get()
+                .unwrap()
+                .owner_name()
+                .to_string()
+        };
+        app.handle_api(header("pl1", owned_by("me", None)));
+        app.handle_api(header("pl2", owned_by("other", None)));
+        app.handle_api(header("pl3", owned_by("nobody", None)));
+        assert_eq!(shown(&app, "pl1"), "Mine", "the account's own name");
+        assert_eq!(shown(&app, "pl2"), "Molly C.", "the library list's");
+        assert_eq!(
+            shown(&app, "pl3"),
+            "nobody",
+            "the id until someone names them"
+        );
+
+        // The list can arrive after the header: the page takes the name
+        // then, and a name Spotify already gave stays.
+        app.handle_api(header("pl2", owned_by("other", Some("Molly"))));
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![
+                    Playlist {
+                        id: "pl2".into(),
+                        owner: owned_by("other", Some("Molly C.")),
+                        ..Playlist::default()
+                    },
+                    Playlist {
+                        id: "pl3".into(),
+                        owner: owned_by("nobody", Some("Nobody")),
+                        ..Playlist::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        });
+        assert_eq!(shown(&app, "pl3"), "Nobody");
+        assert_eq!(shown(&app, "pl2"), "Molly");
     }
 
     #[test]
