@@ -55,8 +55,9 @@ clients. Fastpotify uses its session for:
 - **Playlists the shared app would otherwise serve.** Title, cover, and
   songs of other people's playlists, and of the account's own when there is
   no personal app, so they open without the shared app's quota. Whether a
-  playlist is public, and the owner's name when the session gives none, come
-  from the Web API's library list. These rows carry
+  playlist is public, the owner's name when the session gives none, and the
+  mosaic of a playlist without a cover of its own, come from the Web API's
+  library list. These rows carry
   no per-market availability flag, so a song Spotify does not offer in the
   account's country is not greyed out in such a playlist; it is skipped when
   reached, as it would be anywhere else.
