@@ -295,6 +295,10 @@ pub struct App {
     /// Spotify may expose one recording under several market-specific track
     /// URIs. Map those URIs to the recording identity returned by the API.
     track_recordings: HashMap<String, String>,
+    /// Tracks the Web API has said this account cannot play. A row read
+    /// over the streaming session carries no such flag; one listed here
+    /// stays greyed out.
+    unavailable: HashSet<String>,
     /// Recording identities for which at least one known URI is saved.
     saved_recordings: HashSet<String>,
     /// Optimistic library writes that a stale contains response must not undo.
@@ -614,6 +618,7 @@ impl App {
             saved: HashMap::new(),
             saved_pending: HashSet::new(),
             track_recordings: HashMap::new(),
+            unavailable: HashSet::new(),
             saved_recordings: HashSet::new(),
             saved_writes: HashMap::new(),
             accents: HashMap::new(),
@@ -1419,18 +1424,7 @@ impl App {
                     generation,
                     cache,
                 } => {
-                    if self.user_id() != Some(account_id.as_str()) {
-                        continue;
-                    }
-                    if let Some(page) = self.playlist_pages.get_mut(&id) {
-                        if page.generation != generation {
-                            continue;
-                        }
-                        page.cache_checked = true;
-                        page.pending_cache = cache;
-                    }
-                    self.try_adopt_playlist_cache(&id);
-                    self.checkpoint_playlist_cache(&id);
+                    self.receive_playlist_cache(&account_id, &id, generation, cache);
                 }
                 Event::LikedSongsCache {
                     account_id,
@@ -4101,7 +4095,9 @@ impl App {
                             // The initial request was already in flight when
                             // a longer cached prefix was restored.
                         }
-                        Ok(items) => {
+                        Ok(mut items) => {
+                            note_availability(&mut self.unavailable, &items.items);
+                            fill_availability(&self.unavailable, &mut items.items);
                             tracks = items
                                 .items
                                 .iter()
@@ -5275,6 +5271,34 @@ impl App {
     }
 
     /// Adopt a playlist's cached prefix once Spotify confirms its snapshot.
+    /// A playlist's disk cache has been read. Whether or not the page
+    /// still matches it, what the Web API said about each song's
+    /// availability holds, for rows already shown and rows to come.
+    fn receive_playlist_cache(
+        &mut self,
+        account_id: &str,
+        id: &str,
+        generation: u64,
+        cache: Option<PlaylistCache>,
+    ) {
+        if self.user_id() != Some(account_id) {
+            return;
+        }
+        if let Some(page) = self.playlist_pages.get_mut(id) {
+            if page.generation != generation {
+                return;
+            }
+            page.cache_checked = true;
+            if let Some(cache) = &cache {
+                note_availability(&mut self.unavailable, &cache.items);
+                fill_availability(&self.unavailable, &mut page.items.items);
+            }
+            page.pending_cache = cache;
+        }
+        self.try_adopt_playlist_cache(id);
+        self.checkpoint_playlist_cache(id);
+    }
+
     fn try_adopt_playlist_cache(&mut self, id: &str) {
         let mut uris = Vec::new();
         let mut adders: Vec<String> = Vec::new();
@@ -7577,6 +7601,41 @@ fn remote_action_label(action: RemoteAction) -> &'static str {
     }
 }
 
+/// Remember what the Web API said of each song's availability for this
+/// account: a song it cannot play is kept, one it can is forgotten.
+fn note_availability(unavailable: &mut HashSet<String>, items: &[PlaylistItem]) {
+    for item in items {
+        if let Some(PlayableItem::Track(track)) = item.playable()
+            && let Some(playable) = track.is_playable
+        {
+            if playable {
+                unavailable.remove(&track.uri);
+            } else {
+                unavailable.insert(track.uri.clone());
+            }
+        }
+    }
+}
+
+/// Grey out the songs the Web API has said this account cannot play,
+/// among rows that do not say. A page read over the streaming session
+/// says nothing of the account's market; a song the Web API had greyed
+/// out stays so wherever it recurs, and rows it never described stay
+/// unknown.
+fn fill_availability(unavailable: &HashSet<String>, items: &mut [PlaylistItem]) {
+    if unavailable.is_empty() {
+        return;
+    }
+    for item in items {
+        if let Some(PlayableItem::Track(track)) = item.item.as_mut()
+            && track.is_playable.is_none()
+            && unavailable.contains(&track.uri)
+        {
+            track.is_playable = Some(false);
+        }
+    }
+}
+
 fn friendly_page_error(error: &crate::api::ApiError) -> String {
     match error.status() {
         Some(403) | Some(404) => {
@@ -7868,6 +7927,120 @@ mod tests {
             app.playing_context_uri().as_deref(),
             Some("spotify:playlist:phone")
         );
+    }
+
+    /// A song the Web API had greyed out stays greyed out when the session
+    /// reads the rows, at every place it recurs, whether the Web API's word
+    /// came from an earlier page or from the disk cache of a visit the
+    /// playlist has changed since. Rows it never described stay unknown,
+    /// and a song it later calls playable is no longer greyed out.
+    #[test]
+    fn a_session_read_keeps_a_songs_known_unavailability() {
+        let mut app = headless_app();
+        app.user = Some(User {
+            id: "alice".into(),
+            ..Default::default()
+        });
+        let row = |uri: &str, is_playable: Option<bool>| crate::api::models::PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: uri.into(),
+                is_playable,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let items =
+            |id: &str, rows: Vec<crate::api::models::PlaylistItem>| ApiResponse::PlaylistItems {
+                id: id.into(),
+                offset: 0,
+                generation: 0,
+                result: Ok(crate::api::models::Page {
+                    total: rows.len() as u32,
+                    limit: 50,
+                    items: rows,
+                    ..Default::default()
+                }),
+            };
+        let rows = |app: &App, id: &str| {
+            app.playlist_pages[id]
+                .items
+                .items
+                .iter()
+                .map(|item| match item.playable() {
+                    Some(PlayableItem::Track(track)) => track.is_playable,
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The Web API's word from an earlier page of the same list.
+        app.playlist_pages
+            .insert("pl1".into(), PlaylistPage::default());
+        app.handle_api(items(
+            "pl1",
+            vec![
+                row("spotify:track:gone", Some(false)),
+                row("spotify:track:fine", Some(true)),
+                row("spotify:track:gone", Some(false)),
+            ],
+        ));
+        app.handle_api(items(
+            "pl1",
+            vec![
+                row("spotify:track:gone", None),
+                row("spotify:track:fine", None),
+                row("spotify:track:new", None),
+                row("spotify:track:gone", None),
+            ],
+        ));
+        assert_eq!(rows(&app, "pl1"), [Some(false), None, None, Some(false)]);
+
+        // The Web API's word from the disk cache of another visit, read
+        // after the session page arrived and never adopted, the playlist
+        // having changed since.
+        app.playlist_pages.insert(
+            "pl2".into(),
+            PlaylistPage {
+                playlist: Loadable::Loaded(Playlist {
+                    id: "pl2".into(),
+                    snapshot_id: Some("now".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        app.handle_api(items(
+            "pl2",
+            vec![
+                row("spotify:track:other", None),
+                row("spotify:track:fine", None),
+            ],
+        ));
+        app.receive_playlist_cache(
+            "alice",
+            "pl2",
+            0,
+            Some(PlaylistCache {
+                snapshot: "then".into(),
+                items: vec![row("spotify:track:other", Some(false))],
+                total: 1,
+                next_offset: None,
+            }),
+        );
+        assert_eq!(
+            rows(&app, "pl2"),
+            [Some(false), None],
+            "the cache's word reaches the rows already shown"
+        );
+        assert!(
+            app.playlist_pages["pl2"].pending_cache.is_none(),
+            "though the stale cache itself is not adopted"
+        );
+
+        // A song the Web API later calls playable is no longer greyed out.
+        app.handle_api(items("pl2", vec![row("spotify:track:other", Some(true))]));
+        app.handle_api(items("pl2", vec![row("spotify:track:other", None)]));
+        assert_eq!(rows(&app, "pl2"), [None]);
     }
 
     /// Saving the edit dialog sends the public flag only when its switch

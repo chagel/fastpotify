@@ -58,9 +58,10 @@ clients. Fastpotify uses its session for:
   playlist is public, the owner's name when the session gives none, and the
   mosaic of a playlist without a cover of its own, come from the Web API's
   library list. These rows carry
-  no per-market availability flag, so a song Spotify does not offer in the
-  account's country is not greyed out in such a playlist; it is skipped when
-  reached, as it would be anywhere else.
+  no per-market availability flag. A song the Web API had already greyed
+  out, on an earlier page or in the cache of an earlier visit, stays greyed
+  out when the session reads the rows; one the session reads first is not
+  greyed out, and is skipped when reached, as it would be anywhere else.
 - **Lyrics** when Spotify has them.
 - **Display names** for the user IDs attached to songs in a playlist.
 - **Precise EP types** for releases that the Web API groups with singles.
