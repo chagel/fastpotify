@@ -8,8 +8,8 @@ use egui::Color32;
 
 use crate::api::PlayRequest;
 use crate::api::models::{
-    Album, ArtistRef, Device, Image, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue,
-    Track, TrackCount, User, UserRef, pick_image,
+    Album, ArtistRef, Device, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue, Track,
+    TrackCount, User, UserRef, pick_image,
 };
 use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, LyricsRequest,
@@ -827,30 +827,13 @@ impl App {
             .find(|playlist| playlist.id == id)
     }
 
-    /// Whether the library list says a playlist is public.
-    pub fn library_public(&self, id: &str) -> Option<bool> {
-        self.library_entry(id)?.public
-    }
-
-    /// The cover the library list shows for a playlist, when it holds one.
-    fn library_images(&self, id: &str) -> Vec<Image> {
-        self.library_entry(id)
-            .map(|playlist| playlist.images.clone())
-            .unwrap_or_default()
-    }
-
-    /// The owner's display name where the Web API gave it: the signed-in
-    /// account's own, or the library list's for a playlist it holds.
-    pub fn known_owner_name(&self, id: &str, owner: Option<&str>) -> Option<String> {
-        if let Some(user) = self
-            .user
+    /// The signed-in account's display name, when `owner` is that account.
+    fn own_name(&self, owner: Option<&str>) -> Option<String> {
+        self.user
             .as_ref()
-            .filter(|user| Some(user.id.as_str()) == owner)
-            && let Some(name) = user.display_name.clone()
-        {
-            return Some(name);
-        }
-        self.library_entry(id)?.owner.display_name.clone()
+            .filter(|user| Some(user.id.as_str()) == owner)?
+            .display_name
+            .clone()
     }
 
     pub fn is_saved(&self, uri: &str) -> Option<bool> {
@@ -1819,10 +1802,7 @@ impl App {
         let (name, page) = match kind {
             "playlist" => {
                 let name = self
-                    .library
-                    .playlists
-                    .get()
-                    .and_then(|list| list.iter().find(|playlist| playlist.id == id))
+                    .library_entry(&id)
                     .map(|playlist| playlist.name.clone())
                     .or_else(|| {
                         self.playlist_pages
@@ -3954,28 +3934,17 @@ impl App {
                         self.backend.send(Command::Rootlist);
                     }
                     if let Some(playlists) = self.library.playlists.get() {
-                        for playlist in playlists {
-                            self.saved.insert(playlist.uri.clone(), true);
-                        }
-                        // A header read over the streaming session carries
-                        // no public flag, and may lack the owner's name and
-                        // the cover; pages that arrived before the list
-                        // take them now.
                         for listed in playlists {
+                            self.saved.insert(listed.uri.clone(), true);
+                            // A header read over the streaming session
+                            // lacks what the list carries; pages that
+                            // arrived before the list take it now.
                             if let Some(playlist) = self
                                 .playlist_pages
                                 .get_mut(&listed.id)
                                 .and_then(|page| page.playlist.get_mut())
                             {
-                                if playlist.public.is_none() {
-                                    playlist.public = listed.public;
-                                }
-                                if playlist.owner.display_name.is_none() {
-                                    playlist.owner.display_name = listed.owner.display_name.clone();
-                                }
-                                if playlist.images.is_empty() {
-                                    playlist.images = listed.images.clone();
-                                }
+                                playlist.fill_from(listed);
                             }
                         }
                     }
@@ -4027,21 +3996,14 @@ impl App {
                     return;
                 }
                 if let Ok(playlist) = &mut result {
-                    // The streaming session does not say whether a playlist
-                    // is public; the library list, from the Web API, does.
-                    if playlist.public.is_none() {
-                        playlist.public = self.library_public(&id);
-                    }
-                    // Nor does it always name the owner; the account's own
-                    // name and the library list, both from the Web API, do.
+                    // A header read over the streaming session lacks what
+                    // the Web API gave: the account's own name, and the
+                    // library list's public flag, owner name, and cover.
                     if playlist.owner.display_name.is_none() {
-                        playlist.owner.display_name =
-                            self.known_owner_name(&id, playlist.owner.id.as_deref());
+                        playlist.owner.display_name = self.own_name(playlist.owner.id.as_deref());
                     }
-                    // Nor does it carry the mosaic of a playlist without a
-                    // cover of its own; the library list does.
-                    if playlist.images.is_empty() {
-                        playlist.images = self.library_images(&id);
+                    if let Some(listed) = self.library_entry(&id) {
+                        playlist.fill_from(listed);
                     }
                     if let Some(image) = pick_image(&playlist.images, 300) {
                         self.tint_for(Some(image));
@@ -5270,7 +5232,6 @@ impl App {
         }
     }
 
-    /// Adopt a playlist's cached prefix once Spotify confirms its snapshot.
     /// A playlist's disk cache has been read. Whether or not the page
     /// still matches it, what the Web API said about each song's
     /// availability holds, for rows already shown and rows to come.
@@ -5299,6 +5260,7 @@ impl App {
         self.checkpoint_playlist_cache(id);
     }
 
+    /// Adopt a playlist's cached prefix once Spotify confirms its snapshot.
     fn try_adopt_playlist_cache(&mut self, id: &str) {
         let mut uris = Vec::new();
         let mut adders: Vec<String> = Vec::new();
@@ -7623,9 +7585,6 @@ fn note_availability(unavailable: &mut HashSet<String>, items: &[PlaylistItem]) 
 /// out stays so wherever it recurs, and rows it never described stay
 /// unknown.
 fn fill_availability(unavailable: &HashSet<String>, items: &mut [PlaylistItem]) {
-    if unavailable.is_empty() {
-        return;
-    }
     for item in items {
         if let Some(PlayableItem::Track(track)) = item.item.as_mut()
             && track.is_playable.is_none()
@@ -7758,6 +7717,7 @@ fn evict_lru_map<V>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::Image;
 
     #[test]
     fn shift_wheel_moves_the_shelf_without_scrolling_the_page() {

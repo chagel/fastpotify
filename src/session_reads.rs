@@ -40,19 +40,29 @@ pub enum Failure {
     Retry(anyhow::Error),
 }
 
+/// Any error the session raises is a retry, unless the playlist read
+/// itself was refused, which `refused` tells apart.
 impl From<librespot_core::Error> for Failure {
     fn from(error: librespot_core::Error) -> Self {
-        match error.kind {
-            ErrorKind::NotFound => Self::Definitive(ApiError::Status {
-                status: 404,
-                message: "Not Found".into(),
-            }),
-            ErrorKind::PermissionDenied => Self::Definitive(ApiError::Status {
-                status: 403,
-                message: "Forbidden".into(),
-            }),
-            _ => Self::Retry(error.into()),
-        }
+        Self::Retry(error.into())
+    }
+}
+
+/// How the playlist read failed: Spotify not having the playlist, or not
+/// letting this account see it, is final and what the Web API would say
+/// too. Only the playlist's own endpoint speaks for the playlist; any
+/// other call's refusal is its own.
+fn refused(error: librespot_core::Error) -> Failure {
+    match error.kind {
+        ErrorKind::NotFound => Failure::Definitive(ApiError::Status {
+            status: 404,
+            message: "Not Found".into(),
+        }),
+        ErrorKind::PermissionDenied => Failure::Definitive(ApiError::Status {
+            status: 403,
+            message: "Forbidden".into(),
+        }),
+        _ => error.into(),
     }
 }
 
@@ -76,11 +86,50 @@ pub async fn items(
     offset: u32,
     limit: u32,
 ) -> Result<Page<PlaylistItem>, Failure> {
+    rows_page(session, id, offset, limit, true).await
+}
+
+/// One page of a playlist's rows with who added them and when, but no
+/// song details: what the app samples a long list's tail for.
+pub async fn sample(
+    session: &Session,
+    id: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<Page<PlaylistItem>, Failure> {
+    rows_page(session, id, offset, limit, false).await
+}
+
+async fn rows_page(
+    session: &Session,
+    id: &str,
+    offset: u32,
+    limit: u32,
+    details: bool,
+) -> Result<Page<PlaylistItem>, Failure> {
     let list = window(session, id, offset, limit).await?;
     let rows = rows(&list, offset, limit);
-    let playables = metadata(session, rows.iter().map(|row| &row.id)).await?;
+    let total = total(&list);
+    complete(rows.len(), offset, limit, total)?;
+    let playables = if details {
+        metadata(session, rows.iter().map(|row| &row.id)).await?
+    } else {
+        HashMap::new()
+    };
     let items = rows.iter().map(|row| item(row, &playables)).collect();
-    page(items, total(&list), offset, limit)
+    Ok(page(items, total, offset, limit))
+}
+
+/// A window Spotify cut short of the rows that remain is refused rather
+/// than paged past, since the next page would start after rows nobody was
+/// shown.
+fn complete(count: usize, offset: u32, limit: u32, total: u32) -> Result<(), Failure> {
+    if (count as u32) < limit && offset.saturating_add(count as u32) < total {
+        return Err(Failure::Retry(anyhow::anyhow!(
+            "window at {offset} answered {count} rows of {total}"
+        )));
+    }
+    Ok(())
 }
 
 /// The rows at `offset`, at most `limit` of them; see [`range`].
@@ -90,29 +139,16 @@ fn rows(list: &SessionPlaylist, offset: u32, limit: u32) -> &[SessionRow] {
 }
 
 /// A page as the Web API shapes one; `next` is only ever tested for
-/// presence, and is there while rows remain beyond this page. A window
-/// Spotify cut short of the rows that remain is refused rather than paged
-/// past, since the next page would start after rows nobody was shown.
-fn page(
-    items: Vec<PlaylistItem>,
-    total: u32,
-    offset: u32,
-    limit: u32,
-) -> Result<Page<PlaylistItem>, Failure> {
-    let shown = offset.saturating_add(items.len() as u32);
-    if (items.len() as u32) < limit && shown < total {
-        return Err(Failure::Retry(anyhow::anyhow!(
-            "window at {offset} answered {} rows of {total}",
-            items.len()
-        )));
-    }
-    Ok(Page {
+/// presence, and is there while rows remain beyond this page.
+fn page(items: Vec<PlaylistItem>, total: u32, offset: u32, limit: u32) -> Page<PlaylistItem> {
+    let next = (offset.saturating_add(items.len() as u32) < total).then(String::new);
+    Page {
         items,
         total,
         limit,
         offset,
-        next: (shown < total).then(String::new),
-    })
+        next,
+    }
 }
 
 /// The display name behind a user id, from the profile view Spotify's
@@ -141,7 +177,9 @@ async fn window(
         id: SpotifyId::from_base62(id)?,
         user: None,
     };
-    Ok(SessionPlaylist::get_range(session, &uri, from as usize, length as usize).await?)
+    SessionPlaylist::get_range(session, &uri, from as usize, length as usize)
+        .await
+        .map_err(refused)
 }
 
 /// The owner's user id, which the session decorates onto the playlist's URI.
@@ -305,13 +343,7 @@ async fn metadata(
     if asked.is_empty() {
         return Ok(HashMap::new());
     }
-    // A refusal here is the metadata endpoint's, not the playlist's; the
-    // Web API may still have the rows.
-    let response = session
-        .spclient()
-        .get_extended_metadata(request)
-        .await
-        .map_err(|error| Failure::Retry(error.into()))?;
+    let response = session.spclient().get_extended_metadata(request).await?;
     answers(&asked, response)
 }
 
@@ -821,7 +853,7 @@ mod tests {
     #[test]
     fn a_page_ends_where_the_list_does() {
         let full = |count: usize| vec![PlaylistItem::default(); count];
-        let next = |items, total, offset| page(items, total, offset, 50).unwrap().next_offset();
+        let next = |items, total, offset| page(items, total, offset, 50).next_offset();
         assert_eq!(next(full(50), 170, 100), Some(150));
         assert_eq!(next(full(20), 170, 150), None, "the last, short page");
         assert_eq!(next(Vec::new(), 0, 0), None, "an empty list");
@@ -832,26 +864,33 @@ mod tests {
     /// pages it rather than the next page starting past rows never shown.
     #[test]
     fn a_short_window_is_not_paged_past() {
-        let short = page(vec![PlaylistItem::default(); 30], 500, 0, 50).unwrap_err();
+        let short = complete(30, 0, 50, 500).unwrap_err();
         assert!(matches!(short, Failure::Retry(_)), "{short:?}");
         assert!(format!("{short:?}").contains("30 rows of 500"));
-        assert!(page(Vec::new(), 500, 0, 50).is_err(), "nothing at all");
+        assert!(complete(0, 0, 50, 500).is_err(), "nothing at all");
+        assert!(complete(50, 100, 50, 170).is_ok());
+        assert!(complete(20, 150, 50, 170).is_ok(), "the last, short page");
+        assert!(complete(0, 0, 50, 0).is_ok(), "an empty list");
+        assert!(complete(0, 500, 50, 170).is_ok(), "past the end");
     }
 
     #[test]
     fn a_missing_playlist_is_final_and_a_dropped_line_is_not() {
-        let missing = Failure::from(librespot_core::Error::not_found("gone"));
+        let missing = refused(librespot_core::Error::not_found("gone"));
         assert!(matches!(
             missing,
             Failure::Definitive(ApiError::Status { status: 404, .. })
         ));
-        let private = Failure::from(librespot_core::Error::permission_denied("private"));
+        let private = refused(librespot_core::Error::permission_denied("private"));
         assert!(matches!(
             private,
             Failure::Definitive(ApiError::Status { status: 403, .. })
         ));
-        let dropped = Failure::from(librespot_core::Error::unavailable("offline"));
+        let dropped = refused(librespot_core::Error::unavailable("offline"));
         assert!(matches!(dropped, Failure::Retry(_)));
+        // Any other call's refusal is its own, not the playlist's.
+        let elsewhere = Failure::from(librespot_core::Error::not_found("no such profile"));
+        assert!(matches!(elsewhere, Failure::Retry(_)));
     }
 
     /// The Web API writes a snapshot id as the revision in standard base64

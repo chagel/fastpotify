@@ -2614,9 +2614,9 @@ async fn handle(
     // A session whose long-lived connection has dropped still answers over
     // its HTTP client, so the engine's presence is the only liveness test;
     // a read the session truly cannot make falls back to the Web API below.
-    if let Some(engine) =
-        engine.filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
-        && api.session_serves(operation)
+    if api.session_serves(operation)
+        && let Some(engine) = engine
+            .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
         && let Some(response) = over_session(engine, &request).await
     {
         log::debug!("Spotify route operation={operation:?} source=session");
@@ -2951,8 +2951,6 @@ async fn handle(
     (response, expired.get())
 }
 
-/// Answers a playlist read over the streaming session. `None` when the
-/// session could not, leaving the request to the Web API.
 /// Whether a session signed in as `username` answers for the Web API's
 /// account. Local playback is approved separately, and another account's
 /// view of a playlist is not this one's.
@@ -2965,6 +2963,8 @@ fn same_account(username: &str, account: Option<&AccountId>) -> bool {
 /// the operating system, which is far longer than a page should spin.
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Answers a playlist read over the streaming session. `None` when the
+/// session could not, leaving the request to the Web API.
 async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiResponse> {
     let session = engine.session();
     let read = async {
@@ -2972,8 +2972,11 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
             SessionRead::Header { id } => {
                 SessionAnswer::Header(settle(session_reads::playlist(session, id).await)?)
             }
-            SessionRead::Rows { id, offset, limit } => SessionAnswer::Rows(settle(
-                session_reads::items(session, id, offset, limit).await,
+            SessionRead::Rows { id, offset } => SessionAnswer::Rows(settle(
+                session_reads::items(session, id, offset, PLAYLIST_PAGE_SIZE).await,
+            )?),
+            SessionRead::Sample { id, offset } => SessionAnswer::Rows(settle(
+                session_reads::sample(session, id, offset, PLAYLIST_PAGE_SIZE).await,
             )?),
         })
     };
@@ -2984,29 +2987,27 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
     session_response(request, answer?)
 }
 
-/// The read a request asks of the session: a playlist's header, or a page
-/// of its rows. Anything else, a duplicate check among them, is the Web
-/// API's even where the session serves the operation.
+/// The read a request asks of the session: a playlist's header, a page of
+/// its rows, or a sample of who added them, which needs no song details.
+/// Anything else, a duplicate check among them, is the Web API's even
+/// where the session serves the operation.
 #[derive(Debug, PartialEq)]
 enum SessionRead<'a> {
-    Header {
-        id: &'a str,
-    },
-    Rows {
-        id: &'a str,
-        offset: u32,
-        limit: u32,
-    },
+    Header { id: &'a str },
+    Rows { id: &'a str, offset: u32 },
+    Sample { id: &'a str, offset: u32 },
 }
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
     Some(match request {
         ApiRequest::Playlist { id, .. } => SessionRead::Header { id },
-        ApiRequest::PlaylistItems { id, offset, .. }
-        | ApiRequest::PlaylistSample { id, offset, .. } => SessionRead::Rows {
+        ApiRequest::PlaylistItems { id, offset, .. } => SessionRead::Rows {
             id,
             offset: *offset,
-            limit: PLAYLIST_PAGE_SIZE,
+        },
+        ApiRequest::PlaylistSample { id, offset, .. } => SessionRead::Sample {
+            id,
+            offset: *offset,
         },
         _ => return None,
     })
@@ -3737,11 +3738,7 @@ fn playback_account_matches(credentials: &Credentials, account: Option<AccountId
         .username
         .as_deref()
         .filter(|name| !name.is_empty())
-        .is_some_and(|name| {
-            account
-                .as_ref()
-                .is_some_and(|account| account.as_str() == name)
-        })
+        .is_some_and(|name| same_account(name, account.as_ref()))
 }
 
 #[cfg(test)]
@@ -3758,9 +3755,9 @@ mod session_tests {
         assert!(!same_account("alice", None), "nothing verified yet");
     }
 
-    /// A header read, a page of rows at the request's offset, and nothing
-    /// else: a duplicate check shares the rows' operation but stays with
-    /// the Web API.
+    /// A header read, a page of rows or a sample at the request's offset,
+    /// and nothing else: a duplicate check shares the rows' operation but
+    /// stays with the Web API.
     #[test]
     fn a_request_asks_the_session_for_a_header_or_a_page_or_nothing() {
         let playlist = ApiRequest::Playlist {
@@ -3771,17 +3768,18 @@ mod session_tests {
             session_read(&playlist),
             Some(SessionRead::Header { id: "pl1" })
         );
-        let rows = SessionRead::Rows {
-            id: "pl1",
-            offset: 150,
-            limit: PLAYLIST_PAGE_SIZE,
-        };
         let items = ApiRequest::PlaylistItems {
             id: "pl1".into(),
             offset: 150,
             generation: 1,
         };
-        assert_eq!(session_read(&items), Some(rows));
+        assert_eq!(
+            session_read(&items),
+            Some(SessionRead::Rows {
+                id: "pl1",
+                offset: 150
+            })
+        );
         let sample = ApiRequest::PlaylistSample {
             id: "pl1".into(),
             offset: 150,
@@ -3789,10 +3787,9 @@ mod session_tests {
         };
         assert_eq!(
             session_read(&sample),
-            Some(SessionRead::Rows {
+            Some(SessionRead::Sample {
                 id: "pl1",
-                offset: 150,
-                limit: PLAYLIST_PAGE_SIZE,
+                offset: 150
             })
         );
         let duplicates = ApiRequest::CheckPlaylistDuplicates {
