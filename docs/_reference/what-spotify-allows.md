@@ -60,8 +60,10 @@ clients. Fastpotify uses its session for:
   library list. These rows carry
   no per-market availability flag. A song the Web API had already greyed
   out, on an earlier page or in the cache of an earlier visit, stays greyed
-  out when the session reads the rows; one the session reads first is not
-  greyed out, and is skipped when reached, as it would be anywhere else.
+  out when the session reads the rows. This knowledge belongs to the signed-in
+  account, and a newer Web API answer takes precedence over an older disk
+  cache. A song the session reads first has unknown availability; if it cannot
+  play, it is skipped when reached, as it would be anywhere else.
 - **Lyrics** when Spotify has them.
 - **Display names** for the user IDs attached to songs in a playlist.
 - **Precise EP types** for releases that the Web API groups with singles.

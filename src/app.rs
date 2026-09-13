@@ -295,10 +295,10 @@ pub struct App {
     /// Spotify may expose one recording under several market-specific track
     /// URIs. Map those URIs to the recording identity returned by the API.
     track_recordings: HashMap<String, String>,
-    /// Tracks the Web API has said this account cannot play. A row read
-    /// over the streaming session carries no such flag; one listed here
-    /// stays greyed out.
-    unavailable: HashSet<String>,
+    /// Known playlist-track availability for this account. Keep positive
+    /// answers too, so an older disk cache cannot make a song unavailable
+    /// again after the Web API has confirmed it can play.
+    playlist_availability: HashMap<String, bool>,
     /// Recording identities for which at least one known URI is saved.
     saved_recordings: HashSet<String>,
     /// Optimistic library writes that a stale contains response must not undo.
@@ -618,7 +618,7 @@ impl App {
             saved: HashMap::new(),
             saved_pending: HashSet::new(),
             track_recordings: HashMap::new(),
-            unavailable: HashSet::new(),
+            playlist_availability: HashMap::new(),
             saved_recordings: HashSet::new(),
             saved_writes: HashMap::new(),
             accents: HashMap::new(),
@@ -1566,6 +1566,7 @@ impl App {
         self.saved.clear();
         self.saved_pending.clear();
         self.track_recordings.clear();
+        self.playlist_availability.clear();
         self.saved_recordings.clear();
         self.saved_writes.clear();
         self.queue = Loadable::NotLoaded;
@@ -4058,8 +4059,8 @@ impl App {
                             // a longer cached prefix was restored.
                         }
                         Ok(mut items) => {
-                            note_availability(&mut self.unavailable, &items.items);
-                            fill_availability(&self.unavailable, &mut items.items);
+                            note_availability(&mut self.playlist_availability, &items.items);
+                            fill_availability(&self.playlist_availability, &mut items.items);
                             tracks = items
                                 .items
                                 .iter()
@@ -5240,7 +5241,7 @@ impl App {
         account_id: &str,
         id: &str,
         generation: u64,
-        cache: Option<PlaylistCache>,
+        mut cache: Option<PlaylistCache>,
     ) {
         if self.user_id() != Some(account_id) {
             return;
@@ -5250,9 +5251,24 @@ impl App {
                 return;
             }
             page.cache_checked = true;
-            if let Some(cache) = &cache {
-                note_availability(&mut self.unavailable, &cache.items);
-                fill_availability(&self.unavailable, &mut page.items.items);
+            if let Some(cache) = &mut cache {
+                for (uri, playable) in known_availability(&cache.items) {
+                    self.playlist_availability
+                        .entry(uri.to_string())
+                        .or_insert(playable);
+                }
+                // A cache may arrive after a fresh answer from another page.
+                // Correct its flags before this prefix can be adopted.
+                for row in &mut cache.items {
+                    if let Some(PlayableItem::Track(track)) = row.item.as_mut()
+                        && let Some(playable) = self.playlist_availability.get(&track.uri)
+                    {
+                        track.is_playable = Some(*playable);
+                    }
+                }
+                if fill_availability(&self.playlist_availability, &mut page.items.items) {
+                    page.items.revision = page.items.revision.wrapping_add(1);
+                }
             }
             page.pending_cache = cache;
         }
@@ -7563,20 +7579,18 @@ fn remote_action_label(action: RemoteAction) -> &'static str {
     }
 }
 
-/// Remember what the Web API said of each song's availability for this
-/// account: a song it cannot play is kept, one it can is forgotten.
-fn note_availability(unavailable: &mut HashSet<String>, items: &[PlaylistItem]) {
-    for item in items {
-        if let Some(PlayableItem::Track(track)) = item.playable()
-            && let Some(playable) = track.is_playable
-        {
-            if playable {
-                unavailable.remove(&track.uri);
-            } else {
-                unavailable.insert(track.uri.clone());
-            }
-        }
-    }
+/// Availability explicitly reported for a song; session-only rows are unknown.
+fn known_availability(items: &[PlaylistItem]) -> impl Iterator<Item = (&str, bool)> {
+    items.iter().filter_map(|item| match item.playable()? {
+        PlayableItem::Track(track) => Some((track.uri.as_str(), track.is_playable?)),
+        _ => None,
+    })
+}
+
+/// A fresh Web API answer takes precedence over anything remembered from disk.
+fn note_availability(availability: &mut HashMap<String, bool>, items: &[PlaylistItem]) {
+    availability
+        .extend(known_availability(items).map(|(uri, playable)| (uri.to_string(), playable)));
 }
 
 /// Grey out the songs the Web API has said this account cannot play,
@@ -7584,15 +7598,18 @@ fn note_availability(unavailable: &mut HashSet<String>, items: &[PlaylistItem]) 
 /// says nothing of the account's market; a song the Web API had greyed
 /// out stays so wherever it recurs, and rows it never described stay
 /// unknown.
-fn fill_availability(unavailable: &HashSet<String>, items: &mut [PlaylistItem]) {
+fn fill_availability(availability: &HashMap<String, bool>, items: &mut [PlaylistItem]) -> bool {
+    let mut changed = false;
     for item in items {
         if let Some(PlayableItem::Track(track)) = item.item.as_mut()
             && track.is_playable.is_none()
-            && unavailable.contains(&track.uri)
+            && availability.get(&track.uri) == Some(&false)
         {
             track.is_playable = Some(false);
+            changed = true;
         }
     }
+    changed
 }
 
 fn friendly_page_error(error: &crate::api::ApiError) -> String {
@@ -8001,6 +8018,150 @@ mod tests {
         app.handle_api(items("pl2", vec![row("spotify:track:other", Some(true))]));
         app.handle_api(items("pl2", vec![row("spotify:track:other", None)]));
         assert_eq!(rows(&app, "pl2"), [None]);
+    }
+
+    fn availability_row(playable: Option<bool>) -> PlaylistItem {
+        PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: "spotify:track:availability".into(),
+                is_playable: playable,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn receive_availability_rows(app: &mut App, id: &str, playable: Option<bool>) {
+        app.playlist_pages
+            .entry(id.into())
+            .or_insert_with(|| PlaylistPage {
+                playlist: Loadable::Loaded(Playlist {
+                    id: id.into(),
+                    snapshot_id: Some("now".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: id.into(),
+            offset: 0,
+            generation: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![availability_row(playable)],
+                total: 1,
+                limit: 50,
+                ..Default::default()
+            }),
+        });
+    }
+
+    fn shown_availability(app: &mut App, id: &str) -> Option<bool> {
+        let page = &app.playlist_pages[id];
+        let generation = page.generation;
+        let revision = page.items.revision;
+        let rows = page
+            .items
+            .items
+            .iter()
+            .filter_map(|row| row.playable().cloned().map(|item| (item, None, None)))
+            .collect();
+        let rows = crate::ui::collection::cached_table_items(
+            app,
+            Page::Playlist(id.into()),
+            generation,
+            revision,
+            app.user_names_revision,
+            || rows,
+        );
+        match &rows[0].0 {
+            PlayableItem::Track(track) => track.is_playable,
+            _ => panic!("a track row"),
+        }
+    }
+
+    fn old_availability_cache(playable: bool) -> Option<PlaylistCache> {
+        Some(PlaylistCache {
+            snapshot: "then".into(),
+            items: vec![availability_row(Some(playable))],
+            total: 1,
+            next_offset: None,
+        })
+    }
+
+    #[test]
+    fn playlist_availability_does_not_follow_an_account_switch() {
+        let mut app = headless_app();
+        app.user = Some(User {
+            id: "alice".into(),
+            ..Default::default()
+        });
+        receive_availability_rows(&mut app, "pl1", Some(false));
+        app.handle_auth(AuthStatus::SignedOut);
+        app.handle_auth(AuthStatus::Connected {
+            username: "bob".into(),
+        });
+        app.user = Some(User {
+            id: "bob".into(),
+            ..Default::default()
+        });
+        receive_availability_rows(&mut app, "pl1", None);
+        app.receive_playlist_cache("alice", "pl1", 0, old_availability_cache(false));
+        assert_eq!(shown_availability(&mut app, "pl1"), None);
+    }
+
+    #[test]
+    fn playlist_availability_prefers_fresh_answers_to_late_disk_caches() {
+        for fresh in [true, false] {
+            let mut app = headless_app();
+            app.user = Some(User {
+                id: "alice".into(),
+                ..Default::default()
+            });
+            receive_availability_rows(&mut app, "pl1", Some(fresh));
+            receive_availability_rows(&mut app, "pl2", None);
+            app.receive_playlist_cache("alice", "pl2", 0, old_availability_cache(!fresh));
+            receive_availability_rows(&mut app, "pl3", None);
+            assert_eq!(
+                shown_availability(&mut app, "pl3"),
+                (!fresh).then_some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn playlist_availability_from_disk_reaches_rows_already_drawn() {
+        let mut app = headless_app();
+        app.user = Some(User {
+            id: "alice".into(),
+            ..Default::default()
+        });
+        receive_availability_rows(&mut app, "pl1", None);
+        assert_eq!(shown_availability(&mut app, "pl1"), None);
+        app.receive_playlist_cache("alice", "pl1", 0, old_availability_cache(false));
+        assert_eq!(shown_availability(&mut app, "pl1"), Some(false));
+    }
+
+    #[test]
+    fn playlist_availability_stays_fresh_when_a_cached_prefix_is_adopted() {
+        let mut app = headless_app();
+        app.user = Some(User {
+            id: "alice".into(),
+            ..Default::default()
+        });
+        receive_availability_rows(&mut app, "pl1", Some(true));
+        app.playlist_pages.insert(
+            "pl2".into(),
+            PlaylistPage {
+                playlist: Loadable::Loaded(Playlist {
+                    id: "pl2".into(),
+                    snapshot_id: Some("then".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        app.receive_playlist_cache("alice", "pl2", 0, old_availability_cache(false));
+        assert_eq!(shown_availability(&mut app, "pl2"), Some(true));
     }
 
     /// Saving the edit dialog sends the public flag only when its switch
